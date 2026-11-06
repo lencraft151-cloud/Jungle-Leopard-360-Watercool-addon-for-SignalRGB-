@@ -1,0 +1,14 @@
+{
+	"name": "jungle-leopard-lcd-signalrgb",
+	"version": "1.0.0",
+	"description": "SignalRGB LCD plugin for the 960x480 Jungle Leopard / TZMRIT PF360 AIO pump display",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"test": "node --import ./tests/helpers/register.mjs --test tests/*.test.mjs",
+		"check": "node --check Plugins/JungleLeopard/Jungle_Leopard_LCD.js"
+	},
+	"engines": {
+		"node": ">=20.6"
+	}
+}
