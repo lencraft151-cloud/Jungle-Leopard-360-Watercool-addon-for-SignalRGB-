@@ -87,7 +87,7 @@ ansprechen kann, braucht es den Windows-eigenen **WinUSB**-Treiber:
 3. [Zadig](https://zadig.akeo.ie/) herunterladen und starten (keine Installation nötig, Admin-Abfrage bestätigen).
 4. Menü *Options* → **List All Devices** anhaken.
 5. In der Auswahlliste den Eintrag des Displays wählen. Zadig zeigt den Namen, den das Gerät selbst meldet, nicht
-   den aus dem Geräte-Manager; bei einem Nutzer hieß das Display dort **„MONITOR“**. Bei jedem Kandidaten in den
+   den aus dem Geräte-Manager; das Display kann dort z. B. **„MONITOR“** heißen. Bei jedem Kandidaten in den
    USB-ID-Feldern darunter nachsehen: Nur bei **`33C3`** und **`7788`** (Treiber links: *usbser*) ist es das
    Display. Stehen dort andere Werte: falscher Eintrag, nicht ersetzen.
 6. Rechts neben dem grünen Pfeil **WinUSB** auswählen → **Replace Driver** → warten, bis Zadig „successfully“ meldet.
