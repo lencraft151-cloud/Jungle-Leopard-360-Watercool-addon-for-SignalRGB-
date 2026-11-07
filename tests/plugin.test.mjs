@@ -6,7 +6,7 @@ import fs from "node:fs";
 import LCD from "@SignalRGB/lcd";
 import * as Plugin from "../Jungle_Leopard_LCD.js";
 import { FakePanel, isPanelReady } from "./helpers/fake-panel.mjs";
-import { installClock, installDevice, setProperties } from "./helpers/device-mock.mjs";
+import { cdcConfigDescriptor, installClock, installDevice, setProperties } from "./helpers/device-mock.mjs";
 import { makeBmp24, makeTestPattern } from "./helpers/images.mjs";
 
 const I = Plugin._internals;
@@ -62,8 +62,19 @@ function run(ctx, ms, step = 33) {
 	}
 }
 
+const DIAGNOSIS_TITLES = ["Jungle Leopard LCD - Diagnose", "Jungle Leopard LCD - diagnostics"];
+
+/** Active alerts except the informational startup diagnosis. */
+function problemAlerts(dev) {
+	return dev.activeAlerts().filter((a) => !DIAGNOSIS_TITLES.includes(a.title));
+}
+
 function activeTitles(dev) {
-	return dev.activeAlerts().map((a) => a.title);
+	return problemAlerts(dev).map((a) => a.title);
+}
+
+function diagnosis(dev) {
+	return dev.activeAlerts().find((a) => DIAGNOSIS_TITLES.includes(a.title));
 }
 
 function assertCleanStream(panel) {
@@ -110,6 +121,7 @@ test("Initialize opens the CDC line, identifies the panel and requests a 960x480
 	const { panel, dev } = boot();
 
 	assert.deepEqual(dev.controlTransfers.map(({ type, request, value, index, data, length }) => ({ type, request, value, index, data, length })), [
+		{ type: 0x80, request: 0x06, value: 0x0200, index: 0, data: [], length: 255 },
 		{ type: 0x21, request: 0x20, value: 0, index: 0, data: [0x00, 0xC2, 0x01, 0x00, 0x00, 0x00, 0x08], length: 7 },
 		{ type: 0x21, request: 0x22, value: 3, index: 0, data: [], length: 0 },
 	]);
@@ -187,7 +199,7 @@ test("without a face the panel shows an explanation (German) instead of staying 
 	run(ctx, 1500);
 	assert.ok(ctx.panel.images().length >= 1);
 	assert.deepEqual(activeTitles(ctx.dev), ["Kein LCD-Face aktiv"]);
-	assert.equal(ctx.dev.activeAlerts()[0].priority, 0);
+	assert.equal(problemAlerts(ctx.dev)[0].priority, 0);
 
 	LCD.frameProvider = faceProvider();
 	run(ctx, 300);
@@ -207,7 +219,7 @@ test("an incompatible face without raw-frame support produces a clear error nami
 	const ctx = boot({ face: faceProvider({ jpeg: JPEG_444, bmp: false }) });
 	run(ctx, 300);
 
-	const alert = ctx.dev.activeAlerts()[0];
+	const alert = problemAlerts(ctx.dev)[0];
 	assert.equal(alert.title, "Face nicht kompatibel");
 	assert.ok(alert.description.includes("Farbunterabtastung ist nicht 4:2:0"));
 	assert.ok(ctx.panel.images().length >= 1, "the explanation is shown on the panel");
@@ -226,7 +238,7 @@ test("render errors surface on the panel and as a notification, then clear", () 
 	const ctx = boot({ face: () => { throw new Error("face crashed"); } });
 	run(ctx, 200);
 
-	const alert = ctx.dev.activeAlerts()[0];
+	const alert = problemAlerts(ctx.dev)[0];
 	assert.equal(alert.title, "Darstellungsfehler");
 	assert.ok(alert.description.includes("face crashed"));
 	assert.ok(ctx.panel.images().length >= 1);
@@ -281,7 +293,7 @@ test("a different display behind the generic 33C3:7788 ID is left alone", () => 
 	const ctx = boot({ panel: { infoReply: { model: "HT-8.8inch", width: 462, height: 1920 } } });
 	run(ctx, 500);
 
-	const alert = ctx.dev.activeAlerts()[0];
+	const alert = problemAlerts(ctx.dev)[0];
 	assert.equal(alert.title, "Nicht unterstütztes Display");
 	assert.ok(alert.description.includes("462x1920"));
 	assert.deepEqual(LCD.initializeCalls, []);
@@ -302,13 +314,78 @@ test("a panel that does not answer the info request still works, but the user is
 	assertCleanStream(ctx.panel);
 });
 
-test("startup diagnostics end up in the log file", () => {
+test("startup diagnosis: shown as a notification and written to the log file", () => {
 	const ctx = boot();
+	const text = "Plugin 1.0.2 | Validate: ";
+	const report = diagnosis(ctx.dev);
+
+	assert.ok(report, "diagnosis notification");
+	assert.equal(report.title, "Jungle Leopard LCD - Diagnose");
+	assert.equal(report.priority, 0);
+	assert.ok(report.description.startsWith(text));
+
+	for (const part of [
+		"USB: if0 cls 0x02 [0x83 int]; if1 cls 0x0a [0x02 bulk, 0x81 bulk]",
+		"Endpoints: OUT 0x02 IN 0x81, control if0",
+		"Line: line coding: array(0); DTR/RTS: array(0)",
+		"Write: array(0)",
+		"TXW818-ST7701S-5.5inch-hor, FW 3.1",
+	]) {
+		assert.ok(report.description.includes(part), `missing "${part}" in: ${report.description}`);
+	}
 
 	const lines = ctx.dev.logs.join("\n");
 	assert.match(lines, /USB device: \{"vid":13251,"pid":30600/);
-	assert.match(lines, /CDC line setup: line coding: array\(0\); DTR\/RTS: array\(0\)\. First bulk write returned: array\(0\)\./);
-	assert.match(lines, /Panel check: ok \(model\), \d+ bytes received\./);
+	assert.ok(lines.includes(`Diagnosis: ${report.description}`));
+});
+
+test("the startup diagnosis can be switched off", () => {
+	const ctx = boot({ props: { startupReport: "false" } });
+
+	assert.equal(diagnosis(ctx.dev), undefined);
+	assert.ok(ctx.dev.logs.some((l) => l.includes("Diagnosis: Plugin")), "still logged");
+});
+
+test("endpoints are taken from the device's own USB descriptor", () => {
+	LCD.reset();
+	LCD.frameProvider = faceProvider();
+
+	const clock = installClock();
+	const panel = new FakePanel();
+	panel.clock = clock;
+
+	const descriptor = cdcConfigDescriptor({ commInterface: 2, dataInterface: 3, epInt: 0x84, epOut: 0x01, epIn: 0x82 });
+	const dev = installDevice(panel, clock, { epOut: 0x01, epIn: 0x82, descriptor });
+	setProperties(DEFAULT_PROPS);
+	Plugin.Initialize();
+
+	for (let t = 0; t < 300; t += 33) {
+		Plugin.Render();
+		clock.advance(33);
+	}
+
+	assert.ok(panel.images().length >= 1, "frames reach the panel on the discovered endpoint");
+	assert.ok(I.getState().panelInfo, "the info reply is read from the discovered IN endpoint");
+	assert.ok(dev.controlTransfers.filter((c) => c.type === 0x21).every((c) => c.index === 2), "line setup on the CDC communication interface");
+	assert.ok(diagnosis(dev).description.includes("Endpoints: OUT 0x01 IN 0x82, control if2"));
+	assert.deepEqual(activeTitles(dev), []);
+	assertCleanStream(panel);
+});
+
+test("an unreadable descriptor falls back to the CherryUSB defaults and says so", () => {
+	LCD.reset();
+	LCD.frameProvider = faceProvider();
+
+	const clock = installClock();
+	const panel = new FakePanel();
+	const dev = installDevice(panel, clock, { descriptor: null });
+	setProperties(DEFAULT_PROPS);
+	Plugin.Initialize();
+	Plugin.Render();
+
+	assert.ok(diagnosis(dev).description.includes("USB: unreadable (array(0))"));
+	assert.ok(diagnosis(dev).description.includes("Endpoints: OUT 0x02 IN 0x81"));
+	assert.ok(panel.images().length >= 1);
 });
 
 test("detected but blocked by the Windows serial driver: a clear alert instead of a silent blank display", () => {
@@ -330,7 +407,8 @@ test("detected but blocked by the Windows serial driver: a clear alert instead o
 	assert.ok(alert, `alerts: ${dev.activeAlerts().map((a) => a.title)}`);
 	assert.ok(alert.description.includes("USB write error -12"));
 	assert.ok(alert.description.includes("WinUSB"));
-	assert.ok(dev.logs.some((l) => l.includes("First bulk write returned: number -12")));
+	assert.ok(dev.logs.some((l) => l.includes("Write: number -12")));
+	assert.ok(diagnosis(dev).description.includes("Error: USB write error -12"));
 	assert.equal(dev.logs.filter((l) => l.includes("Reconnect failed")).length, 1, "retries are not logged every time");
 	assert.equal(panel.events.length, 0);
 

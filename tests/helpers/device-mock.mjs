@@ -14,13 +14,38 @@ export function installClock(start = 1_700_000_000_000) {
 	return clock;
 }
 
-export function installDevice(panel, clock, { failWrites = false, writeErrorCode = 0 } = {}) {
+/** A CDC-ACM configuration descriptor (communication + data interface), as a real panel reports it. */
+export function cdcConfigDescriptor({ commInterface = 0, dataInterface = 1, epInt = 0x83, epOut = 0x02, epIn = 0x81 } = {}) {
+	const iface = (number, cls, subclass, protocol, endpoints) => [9, 0x04, number, 0, endpoints, cls, subclass, protocol, 0];
+	const ep = (address, attributes, maxPacket) => [7, 0x05, address, attributes, maxPacket & 0xFF, maxPacket >> 8, attributes === 3 ? 0x10 : 0];
+	const body = [
+		...iface(commInterface, 0x02, 0x02, 0x01, 1),
+		5, 0x24, 0x00, 0x10, 0x01,
+		5, 0x24, 0x01, 0x00, dataInterface,
+		4, 0x24, 0x02, 0x02,
+		5, 0x24, 0x06, commInterface, dataInterface,
+		...ep(epInt, 0x03, 8),
+		...iface(dataInterface, 0x0A, 0x00, 0x00, 2),
+		...ep(epOut, 0x02, 512),
+		...ep(epIn, 0x02, 512),
+	];
+	const total = 9 + body.length;
+
+	return [9, 0x02, total & 0xFF, total >> 8, 2, 1, 0, 0x80, 50, ...body];
+}
+
+export function installDevice(panel, clock, {
+	failWrites = false, writeErrorCode = 0, epOut = 0x02, epIn = 0x81, descriptor = cdcConfigDescriptor(),
+} = {}) {
 	let alertCounter = 0;
 	const dev = {
 		failWrites,
 		// Non-zero: writes return this libusb error code instead of throwing (e.g. -12 when the
 		// Windows serial driver still owns the device), and nothing reaches the panel.
 		writeErrorCode,
+		epOut,
+		epIn,
+		descriptor,
 		logs: [],
 		alerts: [],
 		controlTransfers: [],
@@ -33,7 +58,7 @@ export function installDevice(panel, clock, { failWrites = false, writeErrorCode
 		bulk_transfer(endpoint, data, length) {
 			this.bulkCalls.push({ endpoint, length });
 
-			if (endpoint === 0x02) {
+			if (endpoint === this.epOut) {
 				if (this.failWrites) {
 					throw new Error("LIBUSB_ERROR_NO_DEVICE");
 				}
@@ -51,15 +76,20 @@ export function installDevice(panel, clock, { failWrites = false, writeErrorCode
 				return [];
 			}
 
-			if (endpoint === 0x81) {
+			if (endpoint === this.epIn) {
 				return panel.read(length);
 			}
 
-			throw new Error(`unexpected endpoint ${endpoint}`);
+			// Like libusb: an endpoint the device does not have is an error.
+			throw new Error(`LIBUSB_ERROR_NOT_FOUND (endpoint 0x${endpoint.toString(16)})`);
 		},
 
 		control_transfer(type, request, value, index, data, length, timeout) {
 			this.controlTransfers.push({ type, request, value, index, data: [...data], length, timeout });
+
+			if (type === 0x80 && request === 0x06 && value === 0x0200) {
+				return this.descriptor ? this.descriptor.slice(0, length) : [];
+			}
 
 			return [];
 		},

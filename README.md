@@ -118,6 +118,7 @@ In SignalRGB unter den Geräteeinstellungen von „Jungle Leopard LCD“:
 | **Re-encode Quality** | JPEG-Qualität, falls ein Bild umgewandelt werden muss. Wird automatisch gesenkt, wenn ein Bild sonst das 80-KB-Limit des Displays überschreiten würde, und danach wieder angehoben. |
 | **Message Language** | Sprache der Meldungen auf dem Display und in SignalRGB (Deutsch/English). |
 | **On Shutdown** | Beim Beenden von SignalRGB bzw. im Standby: Display an die eigene Firmware zurückgeben oder Hintergrundbeleuchtung ausschalten. |
+| **Startup Diagnostics** | Zeigt nach dem Start eine SignalRGB-Benachrichtigung „Jungle Leopard LCD - Diagnose“ mit dem USB-Befund (Endpunkte, Ergebnis der Übertragung, Antwort des Displays). Kann ausgeschaltet werden, sobald alles läuft. |
 
 ## Meldungen auf dem Display
 
@@ -152,6 +153,11 @@ ausführen und SignalRGB über das Tray-Symbol beenden und neu starten.
 das Display, Rechtsklick → **Gerät deinstallieren** → Haken bei **„Treiber für dieses Gerät entfernen“** →
 *Deinstallieren*. Danach das Gerät aus- und wieder einstecken oder den PC neu starten; Windows installiert
 wieder den normalen Treiber.
+
+**SignalRGB zeigt das Face, das Display aber weiter seine eigene Animation:** Die Befehle kommen nicht am Panel an.
+Die Benachrichtigung **„Jungle Leopard LCD - Diagnose“** zeigt, welche USB-Endpunkte das Gerät meldet
+(`USB: …`), welche das Plugin benutzt (`Endpoints: …`), was das Senden zurückgab (`Write: …`) und ob das Display
+geantwortet hat (`Reply: …`). Mit diesem Text lässt sich der Fehler eingrenzen.
 
 **Log:** Das Plugin schreibt alle Meldungen mit dem Präfix `[JL-LCD]` in die Gerätekonsole von SignalRGB und in
 SignalRGBs Logdatei (laut Community-Angaben unter `%LOCALAPPDATA%\WhirlwindFX\SignalRgb\Logs\`). Beim Start steht

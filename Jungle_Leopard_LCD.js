@@ -29,9 +29,10 @@ maxFps:readonly
 reencodeQuality:readonly
 messageLanguage:readonly
 shutdownBehavior:readonly
+startupReport:readonly
 */
 
-const PLUGIN_VERSION = "1.0.1";
+const PLUGIN_VERSION = "1.0.2";
 
 export function Name() { return "Jungle Leopard LCD"; }
 export function VendorId() { return 0x33C3; }
@@ -106,14 +107,27 @@ export function ControllableParameters() {
 				"or switch the backlight off.",
 			values: [SHUTDOWN_RELEASE, SHUTDOWN_BACKLIGHT_OFF], default: SHUTDOWN_RELEASE,
 		},
+		{
+			property: "startupReport", group: "", label: "Startup Diagnostics", type: "boolean",
+			description: "Shows a SignalRGB notification after start with the USB diagnosis (endpoints, transfer results, " +
+				"panel answer). Useful when the display stays dark.",
+			default: "true",
+		},
 	];
 }
+
+/** Endpoints SignalRGB offered in Validate(); reported in the startup diagnosis. */
+const offeredEndpoints = [];
 
 /**
  * The CDC communication interface (0) receives line-state control requests,
  * the CDC data interface (1) carries the bulk endpoints. Both must be claimed.
  */
 export function Validate(endpoint) {
+	if (offeredEndpoints.length < 16) {
+		offeredEndpoints.push(endpoint && endpoint.interface);
+	}
+
 	return endpoint.interface === -1 || endpoint.interface === 0 || endpoint.interface === 1;
 }
 
@@ -334,6 +348,63 @@ function extractReply(buffer) {
 	return null;
 }
 
+/** Interfaces and endpoints from a USB configuration descriptor (class-specific descriptors are skipped). */
+function parseConfigDescriptor(bytes) {
+	const interfaces = [];
+	let current = null;
+
+	for (let i = 0; i + 1 < bytes.length;) {
+		const length = bytes[i];
+		const type = bytes[i + 1];
+
+		if (length < 2 || i + length > bytes.length) {
+			break;
+		}
+
+		if (type === 0x04 && length >= 9) {
+			current = { number: bytes[i + 2], alternate: bytes[i + 3], cls: bytes[i + 5], endpoints: [] };
+			interfaces.push(current);
+		} else if (type === 0x05 && length >= 7 && current) {
+			current.endpoints.push({ address: bytes[i + 2], transfer: bytes[i + 3] & 0x03 });
+		}
+
+		i += length;
+	}
+
+	return interfaces;
+}
+
+const BULK = 0x02;
+
+/** Picks the interface with a bulk IN and bulk OUT pair, preferring the CDC data class (0x0A). */
+function pickEndpoints(interfaces) {
+	const hasBulk = (iface, dirIn) => iface.endpoints.find((e) => e.transfer === BULK && Boolean(e.address & 0x80) === dirIn);
+	const candidates = interfaces.filter((iface) => iface.alternate === 0 && hasBulk(iface, true) && hasBulk(iface, false));
+	const data = candidates.find((iface) => iface.cls === 0x0A) || candidates[0];
+
+	if (!data) {
+		return null;
+	}
+
+	const comm = interfaces.find((iface) => iface.cls === 0x02);
+
+	return {
+		out: hasBulk(data, false).address,
+		in: hasBulk(data, true).address,
+		dataInterface: data.number,
+		commInterface: comm ? comm.number : data.number,
+	};
+}
+
+const hex2 = (value) => `0x${(value & 0xFF).toString(16).padStart(2, "0")}`;
+
+function describeInterfaces(interfaces) {
+	const kind = ["ctl", "iso", "bulk", "int"];
+
+	return interfaces.map((iface) => `if${iface.number} cls ${hex2(iface.cls)} [` +
+		`${iface.endpoints.map((e) => `${hex2(e.address)} ${kind[e.transfer]}`).join(", ")}]`).join("; ");
+}
+
 class PanelLink {
 	constructor() {
 		this.lastKeepAlive = 0;
@@ -344,6 +415,42 @@ class PanelLink {
 		this.firstWriteResult = "none";
 		this.lineResults = [];
 		this.infoBytesReceived = 0;
+		this.epOut = USB.EP_OUT;
+		this.epIn = USB.EP_IN;
+		this.commInterface = USB.COMM_INTERFACE;
+		this.descriptorInfo = "not read";
+	}
+
+	/**
+	 * Reads the configuration descriptor (standard GET_DESCRIPTOR) and uses the endpoints the device
+	 * really has. Panel firmwares differ (CherryUSB demo vs. vendor builds), so nothing is assumed.
+	 */
+	discoverEndpoints() {
+		let raw;
+
+		try {
+			raw = device.control_transfer(0x80, 0x06, 0x0200, 0x0000, [], 255, 1000);
+		} catch (e) {
+			this.descriptorInfo = `read failed (${e && e.message ? e.message : e})`;
+
+			return;
+		}
+
+		if (!isByteArray(raw) || raw.length < 9 || raw[1] !== 0x02) {
+			this.descriptorInfo = `unreadable (${describeResult(raw)})`;
+
+			return;
+		}
+
+		const interfaces = parseConfigDescriptor(raw);
+		const picked = pickEndpoints(interfaces);
+		this.descriptorInfo = describeInterfaces(interfaces) || "no interfaces";
+
+		if (picked) {
+			this.epOut = picked.out;
+			this.epIn = picked.in;
+			this.commInterface = picked.commInterface;
+		}
 	}
 
 	write(bytes) {
@@ -355,7 +462,7 @@ class PanelLink {
 				chunk[i] = bytes[offset + i];
 			}
 
-			const result = device.bulk_transfer(USB.EP_OUT, chunk, length);
+			const result = device.bulk_transfer(this.epOut, chunk, length);
 
 			if (this.firstWriteResult === "none") {
 				this.firstWriteResult = describeResult(result);
@@ -377,7 +484,7 @@ class PanelLink {
 
 		for (const [label, request, value, data] of requests) {
 			try {
-				const result = device.control_transfer(0x21, request, value, USB.COMM_INTERFACE, data, data.length, 1000);
+				const result = device.control_transfer(0x21, request, value, this.commInterface, data, data.length, 1000);
 				this.lineResults.push(`${label}: ${describeResult(result)}`);
 			} catch (e) {
 				this.lineResults.push(`${label}: failed (${e && e.message ? e.message : e})`);
@@ -429,7 +536,7 @@ class PanelLink {
 			let chunk;
 
 			try {
-				chunk = device.bulk_transfer(USB.EP_IN, [], USB.READ_BYTES);
+				chunk = device.bulk_transfer(this.epIn, [], USB.READ_BYTES);
 			} catch (e) {
 				log(`Reading the device info failed: ${e && e.message ? e.message : e}`);
 
@@ -1633,6 +1740,12 @@ const MESSAGES = {
 				"The plugin is trying to reconnect.",
 		},
 	},
+	STARTUP_REPORT: {
+		severity: "info",
+		priority: 0,
+		de: { title: "Jungle Leopard LCD - Diagnose", body: "{detail}" },
+		en: { title: "Jungle Leopard LCD - diagnostics", body: "{detail}" },
+	},
 	PANEL_NO_REPLY: {
 		severity: "warning",
 		priority: 1,
@@ -1968,6 +2081,7 @@ function readUserProperties() {
 		reencodeQuality: typeof reencodeQuality === "undefined" ? undefined : reencodeQuality,
 		messageLanguage: typeof messageLanguage === "undefined" ? undefined : messageLanguage,
 		shutdownBehavior: typeof shutdownBehavior === "undefined" ? undefined : shutdownBehavior,
+		startupReport: typeof startupReport === "undefined" ? undefined : startupReport,
 	};
 }
 
@@ -1984,6 +2098,7 @@ function readSettings() {
 		quality: clamp(toNumber(p.reencodeQuality, 85), 40, 95),
 		language: p.messageLanguage === "English" ? "en" : "de",
 		shutdown: p.shutdownBehavior === SHUTDOWN_BACKLIGHT_OFF ? SHUTDOWN_BACKLIGHT_OFF : SHUTDOWN_RELEASE,
+		report: p.startupReport !== false && p.startupReport !== "false",
 	};
 }
 
@@ -2116,8 +2231,30 @@ function identifyPanel() {
 	return verdict;
 }
 
-/** One-time diagnostics, so a log from a real machine shows how SignalRGB's USB layer behaves. */
-function logStartupDiagnostics() {
+/** One line summarizing how SignalRGB's USB layer behaved on this machine. */
+function diagnosisText(failure) {
+	const info = state.panelInfo;
+	const version = info && !Number.isNaN(info.version) ? `, FW ${info.version}` : "";
+	const reply = info ? `${link.infoBytesReceived} B, ${info.model || "unknown model"}${version}` : `none (${link.infoBytesReceived} B)`;
+	const parts = [
+		`Plugin ${PLUGIN_VERSION}`,
+		`Validate: ${offeredEndpoints.length ? offeredEndpoints.join(",") : "-"}`,
+		`USB: ${link.descriptorInfo}`,
+		`Endpoints: OUT ${hex2(link.epOut)} IN ${hex2(link.epIn)}, control if${link.commInterface}`,
+		`Line: ${link.lineResults.join("; ") || "-"}`,
+		`Write: ${link.firstWriteResult}`,
+		`Reply: ${reply}`,
+	];
+
+	if (failure) {
+		parts.push(`Error: ${failure}`);
+	}
+
+	return parts.join(" | ");
+}
+
+/** Logs the startup diagnosis and, unless disabled, shows it as a SignalRGB notification. */
+function reportStartup(failure) {
 	if (typeof device.getDeviceInfo === "function") {
 		try {
 			log(`USB device: ${JSON.stringify(device.getDeviceInfo())}`);
@@ -2126,7 +2263,12 @@ function logStartupDiagnostics() {
 		}
 	}
 
-	log(`CDC line setup: ${link.lineResults.join("; ") || "not run"}. First bulk write returned: ${link.firstWriteResult}.`);
+	const text = diagnosisText(failure);
+	log(`Diagnosis: ${text}`);
+
+	if (state.settings.report) {
+		alerts.raiseMessage("report", "STARTUP_REPORT", state.settings.language, text);
+	}
 }
 
 export function Initialize() {
@@ -2134,19 +2276,17 @@ export function Initialize() {
 	alerts.clearAll();
 	link.resetDiagnostics();
 	log(`Plugin ${PLUGIN_VERSION} starting.`);
-
-	let diagnosticsLogged = false;
+	link.discoverEndpoints();
 
 	try {
 		link.openLine();
 		link.flush();
-		logStartupDiagnostics();
-		diagnosticsLogged = true;
 
 		const verdict = identifyPanel();
 
 		if (verdict.status === "mismatch") {
 			alerts.raiseMessage("panel", "PANEL_MISMATCH", state.settings.language, verdict.reason);
+			reportStartup("");
 
 			return;
 		}
@@ -2156,12 +2296,10 @@ export function Initialize() {
 		}
 
 		enterLive();
+		reportStartup("");
 	} catch (e) {
-		if (!diagnosticsLogged) {
-			logStartupDiagnostics();
-		}
-
 		log(`Panel start failed: ${errorText(e)}`);
+		reportStartup(errorText(e));
 		onLinkError(e, Date.now());
 	}
 
@@ -2277,12 +2415,14 @@ export function onmaxFpsChanged() { applySettings(); }
 export function onreencodeQualityChanged() { applySettings(); }
 export function onmessageLanguageChanged() { applySettings(); }
 export function onshutdownBehaviorChanged() { applySettings(); }
+export function onstartupReportChanged() { applySettings(); }
 
 /** Internal building blocks, exported for the test suite only. SignalRGB ignores this export. */
 export const _internals = Object.freeze({
 	PANEL_WIDTH, PANEL_HEIGHT, MAX_JPEG_BYTES, TARGET_JPEG_BYTES, KEEPALIVE_INTERVAL_MS, STILL_REFRESH_MS,
 	NO_FRAME_GRACE_MS, USB, CMD, LAYOUT_FULL, LAYOUT_SQUARE, ORIENTATION_DEGREES,
 	sum16, buildControlFrame, buildImageEnvelope, avoidMagicCollision, extractReply,
+	parseConfigDescriptor, pickEndpoints, describeInterfaces,
 	parseDeviceInfo, assessPanel, inspectJpeg, panelIncompatibility, decodeBmp,
 	viewportFor, buildPixelMap, composeFrame, JpegEncoder, FONT, wrapText, renderStatusScreen,
 	localizedMessage, describeReason, MESSAGES, REASONS,
