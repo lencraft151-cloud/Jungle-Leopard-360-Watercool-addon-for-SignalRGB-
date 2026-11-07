@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 
-import { _internals as I } from "../Plugins/JungleLeopard/Jungle_Leopard_LCD.js";
+import { _internals as I } from "../Jungle_Leopard_LCD.js";
 import { isPanelReady, readJpegHeader } from "./helpers/fake-panel.mjs";
 import { makeTestPattern } from "./helpers/images.mjs";
 

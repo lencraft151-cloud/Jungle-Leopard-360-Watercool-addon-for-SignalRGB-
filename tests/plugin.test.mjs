@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 
 import LCD from "@SignalRGB/lcd";
-import * as Plugin from "../Plugins/JungleLeopard/Jungle_Leopard_LCD.js";
+import * as Plugin from "../Jungle_Leopard_LCD.js";
 import { FakePanel, isPanelReady } from "./helpers/fake-panel.mjs";
 import { installClock, installDevice, setProperties } from "./helpers/device-mock.mjs";
 import { makeBmp24, makeTestPattern } from "./helpers/images.mjs";

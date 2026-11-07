@@ -6,7 +6,7 @@
 	"type": "module",
 	"scripts": {
 		"test": "node --import ./tests/helpers/register.mjs --test tests/*.test.mjs",
-		"check": "node --check Plugins/JungleLeopard/Jungle_Leopard_LCD.js"
+		"check": "node --check Jungle_Leopard_LCD.js"
 	},
 	"engines": {
 		"node": ">=20.6"

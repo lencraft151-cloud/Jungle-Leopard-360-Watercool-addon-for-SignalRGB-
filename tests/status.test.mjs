@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { _internals as I } from "../Plugins/JungleLeopard/Jungle_Leopard_LCD.js";
+import { _internals as I } from "../Jungle_Leopard_LCD.js";
 import { isPanelReady } from "./helpers/fake-panel.mjs";
 
 test("the bitmap font covers printable ASCII plus German characters", () => {

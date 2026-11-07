@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { _internals as I } from "../Plugins/JungleLeopard/Jungle_Leopard_LCD.js";
+import { _internals as I } from "../Jungle_Leopard_LCD.js";
 import { makeBmp24, makeBmp32, makeTestPattern } from "./helpers/images.mjs";
 
 test("24-bit bottom-up BMP with row padding decodes exactly", () => {

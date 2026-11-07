@@ -42,15 +42,31 @@ Details zur Untersuchung (wie SignalRGB LCD-Faces lädt und rendert, welche Schn
 
 ## Installation
 
-### 1. Plugin kopieren
+Drei Schritte: Plugin in SignalRGB holen, einmal den USB-Treiber umstellen, Face auswählen.
 
-Die Datei [`Plugins/JungleLeopard/Jungle_Leopard_LCD.js`](Plugins/JungleLeopard/Jungle_Leopard_LCD.js) nach
+### 1. Plugin in SignalRGB holen
+
+**Variante A – als Add-on direkt von GitHub (empfohlen, aktualisiert sich selbst):**
+
+SignalRGB schließen ist nicht nötig. Windows-Taste + R drücken, diese Zeile einfügen und Enter:
+
+```
+signalrgb://addon/install?url=https://github.com/lencraft151-cloud/Jungle-Leopard-360-Watercool-addon-for-SignalRGB-
+```
+
+SignalRGB öffnet sich und fragt, ob das Add-on installiert werden soll → bestätigen und, falls gefragt,
+SignalRGB neu starten. Alternativ in SignalRGB unter **Settings → Plugins → Add Plugin Repository** dieselbe
+GitHub-Adresse (ohne `signalrgb://…`) eintragen. SignalRGB lädt das Repository beim Start selbst herunter.
+
+**Variante B – von Hand:** Die Datei [`Jungle_Leopard_LCD.js`](Jungle_Leopard_LCD.js) herunterladen und nach
 
 ```
 %USERPROFILE%\Documents\WhirlwindFX\Plugins\
 ```
 
-kopieren (Ordner ggf. anlegen).
+kopieren (Ordner ggf. anlegen; mit OneDrive heißt der Pfad oft `%USERPROFILE%\OneDrive\Dokumente\WhirlwindFX\Plugins\`).
+
+Nur eine der beiden Varianten verwenden, sonst ist das Plugin doppelt vorhanden.
 
 ### 2. WinUSB-Treiber einrichten (einmalig)
 
@@ -58,12 +74,15 @@ Ab Werk meldet sich das Display als **virtueller COM-Port** (USB-CDC). SignalRGB
 keine COM-Ports öffnen, nur HID-, SMBus- und Raw-USB-Geräte (libusb). Damit SignalRGB das Display direkt
 ansprechen kann, braucht es den Windows-eigenen **WinUSB**-Treiber:
 
-1. Hersteller-App und andere Display-Tools beenden (z. B. JungleLeopardDisplayManager, lcd_aio).
-2. [Zadig](https://zadig.akeo.ie/) starten → *Options* → **List All Devices**.
-3. Das Gerät mit der USB-ID **`33C3 7788`** wählen (Name meist „CherryUSB CDC DEMO“ oder „USB Serial Device“;
-   steht dort „(Interface 0)“, diesen Eintrag nehmen).
-4. Als Ziel **WinUSB** wählen → **Replace Driver**.
-5. SignalRGB neu starten.
+1. Hersteller-App beenden und aus dem Autostart nehmen, ebenso andere Display-Tools
+   (z. B. JungleLeopardDisplayManager, lcd_aio).
+2. [Zadig](https://zadig.akeo.ie/) herunterladen und starten (keine Installation nötig, Admin-Abfrage bestätigen).
+3. Menü *Options* → **List All Devices** anhaken.
+4. In der Auswahlliste das Gerät wählen, bei dem rechts als USB-ID **`33C3 7788`** steht
+   (Name meist „CherryUSB CDC DEMO“ oder „USB Serial Device“). Steht hinter dem Namen „(Interface 0)“, diesen
+   Eintrag nehmen. Gibt es zusätzlich „(Interface 1)“, Schritt 5 danach auch dafür ausführen.
+5. Rechts neben dem grünen Pfeil **WinUSB** auswählen → **Replace Driver** → warten, bis Zadig „successfully“ meldet.
+6. SignalRGB beenden (Rechtsklick aufs Tray-Symbol → Quit) und neu starten.
 
 > **Wichtig:** Danach gibt es keinen COM-Port mehr. Die Hersteller-App und COM-Port-Tools funktionieren erst
 > wieder, wenn der Treiber zurückgesetzt wird (siehe [Rückgängig machen](#rückgängig-machen)).
@@ -72,6 +91,9 @@ ansprechen kann, braucht es den Windows-eigenen **WinUSB**-Treiber:
 
 In SignalRGB erscheint das Display als **„Jungle Leopard LCD“**. Dort wie bei jedem anderen LCD-Gerät ein
 LCD-Face aus der SignalRGB-Library auswählen und anpassen. Die Auswahl speichert SignalRGB selbst.
+
+**Woran man sieht, dass die Verbindung steht:** Ist noch kein Face gewählt, zeigt das Display nach etwa
+1,5 Sekunden „Kein LCD-Face aktiv“. Diese Meldung kommt bereits vom Plugin, die USB-Verbindung funktioniert also.
 
 ## Einstellungen
 
@@ -109,7 +131,8 @@ Nur als SignalRGB-Benachrichtigung (das Display kann sie in diesen Fällen nicht
 
 ## Rückgängig machen
 
-1. Plugin-Datei aus `Documents\WhirlwindFX\Plugins` löschen.
+1. Add-on in SignalRGB unter **Settings → Plugins** entfernen bzw. bei Variante B die Plugin-Datei aus
+   `Documents\WhirlwindFX\Plugins` löschen.
 2. Geräte-Manager → *Ansicht* → *Ausgeblendete Geräte anzeigen* → unter „USB-Geräte“ das Display
    (`33C3:7788`) → **Gerät deinstallieren** und **„Treiber für dieses Gerät entfernen“** anhaken.
 3. Neu starten oder USB neu verbinden. Windows bindet wieder den Standard-Treiber, der COM-Port ist zurück.
