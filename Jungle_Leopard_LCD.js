@@ -32,7 +32,7 @@ shutdownBehavior:readonly
 startupReport:readonly
 */
 
-const PLUGIN_VERSION = "1.0.3";
+const PLUGIN_VERSION = "1.1.0";
 
 export function Name() { return "Jungle Leopard LCD"; }
 export function VendorId() { return 0x33C3; }
@@ -437,7 +437,6 @@ class PanelLink {
 		this.descriptorInfo = "not read";
 		this.endpointSelection = "not run";
 		this.transport = "bulk";
-		this.reader = "bulk";
 		this.probeResults = [];
 	}
 
@@ -505,11 +504,13 @@ class PanelLink {
 		}
 	}
 
-	sendChunk(transport, chunk, length) {
-		return transport === "write" ? device.write(chunk, length) : device.bulk_transfer(this.epOut, chunk, length);
-	}
-
 	write(bytes, transport = this.transport) {
+		if (transport === "bridge") {
+			bridge.sendMessage(bytes);
+
+			return;
+		}
+
 		for (let offset = 0; offset < bytes.length; offset += USB.CHUNK_BYTES) {
 			const length = Math.min(USB.CHUNK_BYTES, bytes.length - offset);
 			const chunk = new Array(length);
@@ -518,7 +519,7 @@ class PanelLink {
 				chunk[i] = bytes[offset + i];
 			}
 
-			const result = this.sendChunk(transport, chunk, length);
+			const result = device.bulk_transfer(this.epOut, chunk, length);
 
 			if (this.firstWriteResult === "none") {
 				this.firstWriteResult = describeResult(result);
@@ -534,8 +535,8 @@ class PanelLink {
 	}
 
 	/** Returns received bytes (possibly none), or null if the read itself failed. */
-	readChunk(reader) {
-		const data = reader === "read" ? device.read([], USB.READ_BYTES, 50) : device.bulk_transfer(this.epIn, [], USB.READ_BYTES);
+	readChunk() {
+		const data = device.bulk_transfer(this.epIn, [], USB.READ_BYTES);
 
 		if (transferError(data)) {
 			return null;
@@ -594,8 +595,8 @@ class PanelLink {
 		this.write(buildImageEnvelope(avoidMagicCollision(jpeg)));
 	}
 
-	/** Sends 0x06 via `transport` and collects the JSON reply via `reader`. */
-	requestInfo(transport, reader, timeoutMs) {
+	/** Sends 0x06 via `transport` and collects the JSON reply from the bulk IN endpoint. */
+	requestInfo(transport, timeoutMs) {
 		try {
 			this.write(buildControlFrame(CMD.GET_INFO), transport);
 		} catch (e) {
@@ -609,7 +610,7 @@ class PanelLink {
 			let chunk;
 
 			try {
-				chunk = this.readChunk(reader);
+				chunk = this.readChunk();
 			} catch (e) {
 				return { reply: null, note: `read failed (${messageOf(e)})` };
 			}
@@ -639,46 +640,223 @@ class PanelLink {
 	}
 
 	/**
-	 * Finds a working way to talk to the panel: SignalRGB's bulk_transfer() on the discovered endpoints,
-	 * or its generic write()/read(), which use the active endpoint. The first combination that gets an
-	 * answer to the info request wins; otherwise the first one that could write at all.
-	 * Returns the info reply (or null). Throws if nothing can write.
+	 * Tries SignalRGB's bulk_transfer() on the discovered endpoints: flush, then the info request.
+	 * Returns the info reply (or null if the panel stays silent). Throws if writing fails, e.g. because
+	 * SignalRGB opened an interface without these endpoints; the caller then falls back to the bridge.
 	 */
 	probe(timeoutMs) {
-		let writable = null;
-
-		for (const transport of ["bulk", "write"]) {
-			try {
-				this.flush(transport);
-			} catch (e) {
-				this.probeResults.push(`${transport}: ${messageOf(e)}`);
-				continue;
-			}
-
-			writable = writable || transport;
-
-			for (const reader of ["bulk", "read"]) {
-				const { reply, note } = this.requestInfo(transport, reader, timeoutMs);
-				this.probeResults.push(`${transport}/${reader}: ${note}`);
-
-				if (reply) {
-					this.transport = transport;
-					this.reader = reader;
-
-					return reply;
-				}
-			}
+		try {
+			this.flush("bulk");
+		} catch (e) {
+			this.probeResults.push(`bulk: ${messageOf(e)}`);
+			throw e;
 		}
 
-		if (!writable) {
-			throw codedError("usb-write", this.probeResults.join("; "));
-		}
+		const { reply, note } = this.requestInfo("bulk", timeoutMs);
+		this.probeResults.push(`bulk: ${note}`);
+		this.transport = "bulk";
 
-		this.transport = writable;
-
-		return null;
+		return reply;
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Bridge transport: SignalRGB opens only interface 0 of a raw USB device, but this panel's bulk
+// endpoints are on interface 1. The finished byte stream then goes over UDP to the local helper
+// "Jungle Leopard LCD Bridge" (bridge/ folder), which writes it to the panel's COM port.
+// ---------------------------------------------------------------------------
+
+const BRIDGE = {
+	HOST: "127.0.0.1",
+	DATA_PORT: 48960,
+	STATUS_PORT: 48961,
+	CHUNK_BYTES: 8192,
+	HEADER_BYTES: 13,
+	STATUS_TIMEOUT_MS: 4000,
+};
+
+/** Text of whatever SignalRGB hands to a UDP "message" callback (string, byte array or {data}). */
+function textOf(value) {
+	if (typeof value === "string") {
+		return value;
+	}
+
+	if (isByteArray(value)) {
+		let text = "";
+
+		for (let i = 0; i < value.length; i++) {
+			text += String.fromCharCode(value[i] & 0xFF);
+		}
+
+		return text;
+	}
+
+	return value && typeof value === "object" && value.data !== undefined ? textOf(value.data) : "";
+}
+
+/** One UDP datagram: "JLB1" | type 1 | message id u32 | chunk index u16 | chunk count u16 | payload. */
+function bridgeDatagram(id, index, count, bytes, start, end) {
+	const packet = new Array(BRIDGE.HEADER_BYTES + end - start);
+	packet[0] = 0x4A;
+	packet[1] = 0x4C;
+	packet[2] = 0x42;
+	packet[3] = 0x31;
+	packet[4] = 0x01;
+	packet[5] = id & 0xFF;
+	packet[6] = (id >>> 8) & 0xFF;
+	packet[7] = (id >>> 16) & 0xFF;
+	packet[8] = (id >>> 24) & 0xFF;
+	packet[9] = index & 0xFF;
+	packet[10] = (index >> 8) & 0xFF;
+	packet[11] = count & 0xFF;
+	packet[12] = (count >> 8) & 0xFF;
+
+	for (let i = start, o = BRIDGE.HEADER_BYTES; i < end; i++, o++) {
+		packet[o] = bytes[i] & 0xFF;
+	}
+
+	return packet;
+}
+
+class BridgeClient {
+	constructor() {
+		this.reset();
+	}
+
+	reset() {
+		this.socket = null;
+		this.api = "none";
+		this.error = "";
+		this.listening = "no";
+		this.messageId = 0;
+		this.status = "";
+		this.statusAt = 0;
+		this.openedAt = 0;
+		this.messagesSent = 0;
+	}
+
+	/** Uses SignalRGB's udp feature: a socket (send + status listener) or the older udp.send(). */
+	open(now) {
+		if (this.api !== "none") {
+			return true;
+		}
+
+		try {
+			if (typeof device.addFeature === "function") {
+				device.addFeature("udp");
+			}
+		} catch (e) {
+			this.error = `addFeature: ${messageOf(e)}`;
+		}
+
+		const api = typeof udp === "undefined" ? null : udp;
+
+		if (!api) {
+			this.error = this.error || "SignalRGB udp feature not available";
+
+			return false;
+		}
+
+		this.openedAt = now;
+
+		if (typeof api.createSocket === "function") {
+			this.socket = api.createSocket();
+			this.api = "socket";
+
+			try {
+				this.socket.on("message", (...args) => this.onMessage(args));
+				this.socket.bind(BRIDGE.STATUS_PORT);
+				this.listening = "yes";
+			} catch (e) {
+				this.listening = `failed (${messageOf(e)})`;
+			}
+
+			return true;
+		}
+
+		if (typeof api.send === "function") {
+			this.api = "send";
+			this.listening = "unsupported";
+
+			return true;
+		}
+
+		this.error = "udp offers neither createSocket nor send";
+
+		return false;
+	}
+
+	sendMessage(bytes) {
+		this.messageId = (this.messageId + 1) >>> 0;
+
+		const count = Math.max(1, Math.ceil(bytes.length / BRIDGE.CHUNK_BYTES));
+
+		for (let index = 0; index < count; index++) {
+			const start = index * BRIDGE.CHUNK_BYTES;
+			const packet = bridgeDatagram(this.messageId, index, count, bytes, start, Math.min(bytes.length, start + BRIDGE.CHUNK_BYTES));
+			const result = this.api === "socket"
+				? this.socket.write(packet, BRIDGE.HOST, BRIDGE.DATA_PORT)
+				: udp.send(BRIDGE.HOST, BRIDGE.DATA_PORT, packet);
+
+			if (typeof result === "number" && result < 0) {
+				throw codedError("bridge-send", `UDP send error ${result}`);
+			}
+		}
+
+		this.messagesSent++;
+	}
+
+	onMessage(args) {
+		for (const arg of args) {
+			const text = textOf(arg);
+
+			if (text.indexOf("JLB1 STATUS") >= 0) {
+				this.status = text;
+				this.statusAt = Date.now();
+
+				return;
+			}
+		}
+	}
+
+	/** Parsed "key=value" pairs of the last status message. */
+	statusFields() {
+		const fields = {};
+
+		for (const part of this.status.split(" ")) {
+			const at = part.indexOf("=");
+
+			if (at > 0) {
+				fields[part.slice(0, at)] = part.slice(at + 1);
+			}
+		}
+
+		return fields;
+	}
+
+	describe() {
+		const fields = this.statusFields();
+		const status = this.status
+			? `${fields.state || "?"} ${fields.port || ""} (msgs ${fields.msgs || 0}, v${fields.version || "?"})`
+			: "no answer yet";
+
+		return `${this.api}, listen ${this.listening}, sent ${this.messagesSent}, bridge ${status}`;
+	}
+
+	close() {
+		if (this.socket) {
+			try {
+				this.socket.close();
+			} catch (e) {
+				// Socket already gone.
+			}
+		}
+
+		this.reset();
+	}
+}
+
+const bridge = new BridgeClient();
 
 // ---------------------------------------------------------------------------
 // Device info (reply to 0x06 is JSON, field names vary between firmwares)
@@ -1846,13 +2024,13 @@ const MESSAGES = {
 		priority: 1,
 		de: {
 			title: "Verbindung zum Display unterbrochen",
-			body: "Die USB-Übertragung ist fehlgeschlagen ({detail}). Ist der WinUSB-Treiber eingerichtet " +
-				"(Zadig, Anleitung Schritt 2)? Das Plugin versucht, die Verbindung wiederherzustellen.",
+			body: "Die Übertragung zum Display ist fehlgeschlagen ({detail}). Ist die 'Jungle Leopard LCD Bridge' " +
+				"installiert (Anleitung Schritt 2)? Das Plugin versucht, die Verbindung wiederherzustellen.",
 		},
 		en: {
 			title: "Lost connection to the display",
-			body: "The USB transfer failed ({detail}). Is the WinUSB driver installed (Zadig, setup step 2)? " +
-				"The plugin is trying to reconnect.",
+			body: "Sending to the display failed ({detail}). Is the 'Jungle Leopard LCD Bridge' installed " +
+				"(setup step 2)? The plugin is trying to reconnect.",
 		},
 	},
 	STARTUP_REPORT: {
@@ -1861,20 +2039,62 @@ const MESSAGES = {
 		de: { title: "Jungle Leopard LCD - Diagnose", body: "{detail}" },
 		en: { title: "Jungle Leopard LCD - diagnostics", body: "{detail}" },
 	},
+	BRIDGE_MISSING: {
+		severity: "error",
+		priority: 1,
+		de: {
+			title: "Bridge nicht erreichbar",
+			body: "SignalRGB kann dieses Display nicht direkt ansprechen und schickt die Bilder an das Hilfsprogramm " +
+				"'Jungle Leopard LCD Bridge'. Es antwortet nicht. Bitte die Bridge installieren bzw. starten " +
+				"(Anleitung im README, Abschnitt Bridge).",
+		},
+		en: {
+			title: "Bridge not reachable",
+			body: "SignalRGB cannot drive this display directly and sends the frames to the helper " +
+				"'Jungle Leopard LCD Bridge'. It does not answer. Please install or start the bridge " +
+				"(see the README, section Bridge).",
+		},
+	},
+	BRIDGE_NO_PORT: {
+		severity: "error",
+		priority: 1,
+		de: {
+			title: "Display-COM-Port nicht gefunden",
+			body: "Die Bridge läuft, findet aber den COM-Port des Displays nicht. Ist noch der WinUSB-Treiber aus Zadig " +
+				"aktiv? Dann im Geräte-Manager entfernen, bis das Display wieder als 'Serielles USB-Gerät (COMx)' erscheint.",
+		},
+		en: {
+			title: "Display COM port not found",
+			body: "The bridge is running but cannot find the display's COM port. Is the WinUSB driver from Zadig still " +
+				"installed? Remove it in Device Manager until the display shows up as 'USB Serial Device (COMx)' again.",
+		},
+	},
+	BRIDGE_ERROR: {
+		severity: "error",
+		priority: 1,
+		de: {
+			title: "Bridge meldet einen Fehler",
+			body: "Die Bridge kann den COM-Port {detail} nicht benutzen. Ist die Hersteller-App noch geöffnet? " +
+				"Details im Log der Bridge (Rechtsklick auf ihr Symbol im Infobereich).",
+		},
+		en: {
+			title: "Bridge reports an error",
+			body: "The bridge cannot use COM port {detail}. Is the vendor app still open? " +
+				"Details are in the bridge log (right-click its tray icon).",
+		},
+	},
 	PANEL_NO_REPLY: {
 		severity: "warning",
 		priority: 1,
 		de: {
 			title: "Display antwortet nicht",
-			body: "SignalRGB hat das Display erkannt, bekommt aber keine Antwort. Meist fehlt der WinUSB-Treiber " +
-				"(Zadig, Anleitung Schritt 2) oder die Hersteller-App belegt das Display noch. Zeigt das Display " +
-				"trotzdem ein Bild, kann diese Meldung ignoriert werden.",
+			body: "SignalRGB hat das Display erkannt, bekommt aber keine Antwort. Meist belegt die Hersteller-App " +
+				"das Display noch. Zeigt das Display trotzdem ein Bild, kann diese Meldung ignoriert werden.",
 		},
 		en: {
 			title: "Display does not respond",
-			body: "SignalRGB detected the display but gets no answer. Usually the WinUSB driver is missing " +
-				"(Zadig, setup step 2) or the vendor app still holds the display. If the display shows a picture " +
-				"anyway, this message can be ignored.",
+			body: "SignalRGB detected the display but gets no answer. Usually the vendor app still holds the " +
+				"display. If the display shows a picture anyway, this message can be ignored.",
 		},
 	},
 };
@@ -2237,6 +2457,8 @@ function createState() {
 		framesSent: 0,
 		lastPipelineError: "",
 		lastReconnectError: "",
+		bridgeMode: false,
+		bridgeReported: false,
 	};
 }
 
@@ -2359,9 +2581,13 @@ function diagnosisText(failure) {
 		`Line: ${link.lineResults.join("; ") || "-"}`,
 		`Write: ${link.firstWriteResult}`,
 		`Probe: ${link.probeResults.join("; ") || "-"}`,
-		`Transport: ${link.transport}/${link.reader}`,
+		`Transport: ${link.transport}`,
 		`Reply: ${reply}`,
 	];
+
+	if (state.bridgeMode || bridge.error) {
+		parts.push(`Bridge: ${bridge.error || bridge.describe()}`);
+	}
 
 	if (failure) {
 		parts.push(`Error: ${failure}`);
@@ -2391,6 +2617,7 @@ function reportStartup(failure) {
 export function Initialize() {
 	state = createState();
 	alerts.clearAll();
+	bridge.close();
 	link.resetDiagnostics();
 	log(`Plugin ${PLUGIN_VERSION} starting.`);
 	link.discoverEndpoints();
@@ -2415,13 +2642,64 @@ export function Initialize() {
 		enterLive();
 		reportStartup("");
 	} catch (e) {
-		log(`Panel start failed: ${errorText(e)}`);
-		reportStartup(errorText(e));
-		onLinkError(e, Date.now());
+		log(`Direct USB is not usable (${errorText(e)}), using the bridge.`);
+		startBridge(e);
 	}
 
 	state.active = true;
 	configureViewport();
+}
+
+/** Fallback when SignalRGB cannot write to the panel's bulk endpoint: hand the stream to the local bridge. */
+function startBridge(usbError) {
+	if (!bridge.open(Date.now())) {
+		const reason = `${errorText(usbError)}; bridge: ${bridge.error}`;
+		reportStartup(reason);
+		onLinkError(codedError("no-transport", reason), Date.now());
+
+		return;
+	}
+
+	link.transport = "bridge";
+	state.bridgeMode = true;
+
+	try {
+		link.flush();
+		enterLive();
+		reportStartup("");
+	} catch (e) {
+		reportStartup(errorText(e));
+		onLinkError(e, Date.now());
+	}
+}
+
+/** Turns the bridge's status messages into SignalRGB notifications (only if they can be received at all). */
+function monitorBridge(now) {
+	if (bridge.listening !== "yes") {
+		return;
+	}
+
+	const language = state.settings.language;
+	const fields = bridge.statusFields();
+	const fresh = bridge.statusAt > 0 && now - bridge.statusAt <= BRIDGE.STATUS_TIMEOUT_MS;
+
+	if (!fresh) {
+		if (now - bridge.openedAt > BRIDGE.STATUS_TIMEOUT_MS) {
+			alerts.raiseMessage("bridge", "BRIDGE_MISSING", language, "");
+		}
+	} else if (fields.state === "noport") {
+		alerts.raiseMessage("bridge", "BRIDGE_NO_PORT", language, "");
+	} else if (fields.state === "error") {
+		alerts.raiseMessage("bridge", "BRIDGE_ERROR", language, fields.port || "?");
+	} else {
+		alerts.clear("bridge");
+	}
+
+	// Refresh the diagnosis once the bridge has answered, or once it is clear that it does not.
+	if (!state.bridgeReported && (fresh || now - bridge.openedAt > BRIDGE.STATUS_TIMEOUT_MS)) {
+		state.bridgeReported = true;
+		reportStartup("");
+	}
 }
 
 function updateFrameAlerts(frame) {
@@ -2459,6 +2737,10 @@ export function Render() {
 	applySettings();
 
 	const now = Date.now();
+
+	if (state.bridgeMode) {
+		monitorBridge(now);
+	}
 
 	if (!state.linkOk) {
 		tryRecover(now);
@@ -2522,6 +2804,8 @@ export function Shutdown(SystemSuspending) {
 	} catch (e) {
 		log(`Shutdown write failed: ${errorText(e)}`);
 	}
+
+	bridge.close();
 }
 
 export function onfaceLayoutChanged() { applySettings(); }
@@ -2540,6 +2824,7 @@ export const _internals = Object.freeze({
 	NO_FRAME_GRACE_MS, USB, CMD, LAYOUT_FULL, LAYOUT_SQUARE, ORIENTATION_DEGREES,
 	sum16, buildControlFrame, buildImageEnvelope, avoidMagicCollision, extractReply,
 	parseConfigDescriptor, pickEndpoints, describeInterfaces,
+	BRIDGE, BridgeClient, bridgeDatagram, textOf, getBridge: () => bridge,
 	parseDeviceInfo, assessPanel, inspectJpeg, panelIncompatibility, decodeBmp,
 	viewportFor, buildPixelMap, composeFrame, JpegEncoder, FONT, wrapText, renderStatusScreen,
 	localizedMessage, describeReason, MESSAGES, REASONS,

@@ -141,6 +141,20 @@ Format unbekannt, läuft es normal weiter.
   endpunktlose Interface 0 aktiv. Ab 1.0.3 wird nur Interface 1 freigegeben (wie im offiziellen ASUS-Ryuo-Plugin),
   Interface 1 per `set_endpoint` aktiviert, sofern SignalRGB es auflistet, und beim Start werden `bulk_transfer`
   sowie das generische `write`/`read` ausprobiert. Die Diagnose-Benachrichtigung zeigt das Ergebnis (`Probe:`).
+* **Befund am echten Gerät (Plugin 1.0.3):** `Validate()` wird bei `rawusb` nicht aufgerufen (`Validate: -`),
+  `getHidEndpoints()` liefert nichts, `device.write()` ist bei Raw-USB nicht verfügbar („Selected IO Protocol isn't
+  HID, function is not available!“) und `bulk_transfer` auf Interface 1 liefert weiter `array(-1)`. Die
+  Plugin-API bietet keine Möglichkeit, ein anderes Interface zu öffnen. **SignalRGB kann dieses Display also nicht
+  direkt beschreiben.**
+* **Lösung ab Plugin 1.1.0 – Bridge:** Plugins dürfen UDP senden (`device.addFeature("udp")` bzw. `@SignalRGB/udp`).
+  Schlägt der direkte USB-Weg fehl, schickt das Plugin den fertigen Byte-Strom in Datagrammen (`JLB1`-Kopf,
+  max. 8 KB Nutzdaten) an `127.0.0.1:48960`. Die „Jungle Leopard LCD Bridge“ (`bridge/`, C# 5 + PowerShell, ohne
+  Admin-Rechte) setzt die Nachrichten zusammen und schreibt sie auf den COM-Port des Displays (Suche über
+  `VID_33C3&PID_7788` in der Registry). Ihren Zustand meldet sie jede Sekunde an `127.0.0.1:48961`; das Plugin
+  zeigt daraus Benachrichtigungen (Bridge fehlt, kein COM-Port, Port belegt). Dafür muss das Display den normalen
+  Windows-Treiber (usbser, COM-Port) behalten.
+* **Offen:** Ob das Gerät mit Revision 2.00 dasselbe Bildprotokoll spricht wie die von senesees/yughias
+  dokumentierte Firmware 3.1, zeigt erst der Test über die Bridge.
 * **Feldnamen der Geräteinfo:** Nur der Modellstring ist bekannt; der Parser ist deshalb tolerant.
 
 ## Quellen

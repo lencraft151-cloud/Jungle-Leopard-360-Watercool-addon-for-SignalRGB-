@@ -311,7 +311,7 @@ test("a panel that does not answer the info request still works, but the user is
 
 	const alert = ctx.dev.activeAlerts().find((a) => a.title === "Display antwortet nicht");
 	assert.ok(alert, "no-reply warning");
-	assert.ok(alert.description.includes("WinUSB"));
+	assert.ok(alert.description.includes("Hersteller-App"));
 	assertCleanStream(ctx.panel);
 });
 
@@ -392,20 +392,6 @@ function bootWith(deviceOptions, props = {}) {
 	return { clock, panel, dev };
 }
 
-test("reported hardware: bulk_transfer returns array(-1), so the plugin switches to SignalRGB's write/read", () => {
-	const descriptor = cdcConfigDescriptor({ epInt: 0x81, epOut: 0x01, epIn: 0x82 });
-	const { panel, dev } = bootWith({ epOut: 0x01, epIn: 0x82, descriptor, bulkBroken: true });
-	const report = diagnosis(dev).description;
-
-	assert.ok(panel.images().length >= 1, "frames reach the panel");
-	assert.ok(I.getState().panelInfo, "the info reply arrives via read()");
-	assert.ok(report.includes("Write: array(-1)"), report);
-	assert.ok(report.includes("Probe: bulk: USB write error -1; write/bulk: read error; write/read: reply"), report);
-	assert.ok(report.includes("Transport: write/read"), report);
-	assert.deepEqual(activeTitles(dev), []);
-	assertCleanStream(panel);
-});
-
 test("the data interface is made the active endpoint when SignalRGB lists it", () => {
 	const hidEndpoints = [
 		{ interface: 0, usage: 0, usage_page: 0, collection: 0 },
@@ -417,12 +403,12 @@ test("the data interface is made the active endpoint when SignalRGB lists it", (
 	assert.ok(diagnosis(dev).description.includes("Active: set_endpoint if1 (listed: 0,1)"));
 });
 
-test("when no USB path works at all, the user gets the connection alert with the probe results", () => {
-	const { panel, dev } = bootWith({ bulkBroken: true, genericBroken: true });
+test("when neither USB nor the bridge transport is available, the user gets the connection alert with both reasons", () => {
+	const { panel, dev } = bootWith({ bulkBroken: true });
 	const alert = problemAlerts(dev).find((a) => a.title === "Verbindung zum Display unterbrochen");
 
 	assert.ok(alert, `alerts: ${activeTitles(dev)}`);
-	assert.ok(alert.description.includes("bulk: USB write error -1; write: LIBUSB_ERROR_IO"), alert.description);
+	assert.ok(alert.description.includes("USB write error -1; bridge: SignalRGB udp feature not available"), alert.description);
 	assert.equal(panel.images().length, 0);
 });
 
@@ -460,9 +446,9 @@ test("detected but blocked by the Windows serial driver: a clear alert instead o
 	const alert = dev.activeAlerts().find((a) => a.title === "Verbindung zum Display unterbrochen");
 	assert.ok(alert, `alerts: ${dev.activeAlerts().map((a) => a.title)}`);
 	assert.ok(alert.description.includes("USB write error -12"));
-	assert.ok(alert.description.includes("WinUSB"));
+	assert.ok(alert.description.includes("Jungle Leopard LCD Bridge"));
 	assert.ok(dev.logs.some((l) => l.includes("Write: number -12")));
-	assert.ok(diagnosis(dev).description.includes("Error: bulk: USB write error -12; write: USB write error -12"));
+	assert.ok(diagnosis(dev).description.includes("Error: USB write error -12; bridge: SignalRGB udp feature not available"));
 	assert.equal(dev.logs.filter((l) => l.includes("Reconnect failed")).length, 1, "retries are not logged every time");
 	assert.equal(panel.events.length, 0);
 
