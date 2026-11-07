@@ -74,15 +74,22 @@ Ab Werk meldet sich das Display als **virtueller COM-Port** (USB-CDC). SignalRGB
 keine COM-Ports öffnen, nur HID-, SMBus- und Raw-USB-Geräte (libusb). Damit SignalRGB das Display direkt
 ansprechen kann, braucht es den Windows-eigenen **WinUSB**-Treiber:
 
+> **Vorsicht:** In Zadig tauchen viele Einträge mit „(Interface …)“ auf, die meisten gehören zu Tastatur, Maus
+> oder Headset. Wer dort den Treiber ersetzt, legt dieses Gerät für SignalRGB (und evtl. für Windows) lahm.
+> Nur ersetzen, wenn in den **USB-ID-Feldern unter der Auswahlliste exakt `33C3` und `7788`** stehen.
+
 1. Hersteller-App beenden und aus dem Autostart nehmen, ebenso andere Display-Tools
    (z. B. JungleLeopardDisplayManager, lcd_aio).
-2. [Zadig](https://zadig.akeo.ie/) herunterladen und starten (keine Installation nötig, Admin-Abfrage bestätigen).
-3. Menü *Options* → **List All Devices** anhaken.
-4. In der Auswahlliste das Gerät wählen, bei dem rechts als USB-ID **`33C3 7788`** steht
-   (Name meist „CherryUSB CDC DEMO“ oder „USB Serial Device“). Steht hinter dem Namen „(Interface 0)“, diesen
-   Eintrag nehmen. Gibt es zusätzlich „(Interface 1)“, Schritt 5 danach auch dafür ausführen.
-5. Rechts neben dem grünen Pfeil **WinUSB** auswählen → **Replace Driver** → warten, bis Zadig „successfully“ meldet.
-6. SignalRGB beenden (Rechtsklick aufs Tray-Symbol → Quit) und neu starten.
+2. Das Display zuerst im **Geräte-Manager** finden: *Anschlüsse (COM & LPT)* → „USB-Serielles Gerät (COMx)“
+   → Rechtsklick → *Eigenschaften* → *Details* → *Hardware-IDs*. Steht dort `VID_33C3&PID_7788`, ist das das
+   Display. Den Namen merken. Ist kein solcher Eintrag da, ist das Display nicht per USB verbunden; dann hilft
+   Zadig nicht.
+3. [Zadig](https://zadig.akeo.ie/) herunterladen und starten (keine Installation nötig, Admin-Abfrage bestätigen).
+4. Menü *Options* → **List All Devices** anhaken.
+5. In der Auswahlliste den Eintrag mit dem Namen aus Schritt 2 wählen und prüfen, dass in den USB-ID-Feldern
+   darunter **`33C3`** und **`7788`** stehen. Stehen dort andere Werte: falscher Eintrag, nicht ersetzen.
+6. Rechts neben dem grünen Pfeil **WinUSB** auswählen → **Replace Driver** → warten, bis Zadig „successfully“ meldet.
+7. SignalRGB beenden (Rechtsklick aufs Tray-Symbol → Quit) und neu starten.
 
 > **Wichtig:** Danach gibt es keinen COM-Port mehr. Die Hersteller-App und COM-Port-Tools funktionieren erst
 > wieder, wenn der Treiber zurückgesetzt wird (siehe [Rückgängig machen](#rückgängig-machen)).
@@ -136,6 +143,13 @@ Nur als SignalRGB-Benachrichtigung (das Display kann sie in diesen Fällen nicht
 **SignalRGB zeigt „Jungle Leopard LCD“ an, das Display bleibt aber leer:** SignalRGB erkennt das Gerät schon
 ohne WinUSB-Treiber, weil es nur die USB-ID sieht. Senden kann es erst mit dem Treiber, also Schritt 2
 ausführen und SignalRGB über das Tray-Symbol beenden und neu starten.
+
+**In Zadig versehentlich den Treiber eines anderen Geräts ersetzt (z. B. Tastatur):** Geräte-Manager öffnen
+(Windows-Taste + X → *Geräte-Manager*) → *USB-Geräte* aufklappen. Bei jedem Eintrag Rechtsklick →
+*Eigenschaften* → Reiter *Treiber*: Steht als Treiberanbieter **libwdi**, hat Zadig ihn installiert. Ist es nicht
+das Display, Rechtsklick → **Gerät deinstallieren** → Haken bei **„Treiber für dieses Gerät entfernen“** →
+*Deinstallieren*. Danach das Gerät aus- und wieder einstecken oder den PC neu starten; Windows installiert
+wieder den normalen Treiber.
 
 **Log:** Das Plugin schreibt alle Meldungen mit dem Präfix `[JL-LCD]` in die Gerätekonsole von SignalRGB und in
 SignalRGBs Logdatei (laut Community-Angaben unter `%LOCALAPPDATA%\WhirlwindFX\SignalRgb\Logs\`). Beim Start steht
