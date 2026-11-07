@@ -14,14 +14,21 @@ export function installClock(start = 1_700_000_000_000) {
 	return clock;
 }
 
-export function installDevice(panel, clock, { failWrites = false } = {}) {
+export function installDevice(panel, clock, { failWrites = false, writeErrorCode = 0 } = {}) {
 	let alertCounter = 0;
 	const dev = {
 		failWrites,
+		// Non-zero: writes return this libusb error code instead of throwing (e.g. -12 when the
+		// Windows serial driver still owns the device), and nothing reaches the panel.
+		writeErrorCode,
 		logs: [],
 		alerts: [],
 		controlTransfers: [],
 		bulkCalls: [],
+
+		getDeviceInfo() {
+			return { vid: 0x33C3, pid: 0x7788, manufacturer: "CherryUSB", product: "CherryUSB CDC DEMO", serial: "2022123456", type: "rawusb" };
+		},
 
 		bulk_transfer(endpoint, data, length) {
 			this.bulkCalls.push({ endpoint, length });
@@ -29,6 +36,10 @@ export function installDevice(panel, clock, { failWrites = false } = {}) {
 			if (endpoint === 0x02) {
 				if (this.failWrites) {
 					throw new Error("LIBUSB_ERROR_NO_DEVICE");
+				}
+
+				if (this.writeErrorCode) {
+					return this.writeErrorCode;
 				}
 
 				if (data.length !== length) {

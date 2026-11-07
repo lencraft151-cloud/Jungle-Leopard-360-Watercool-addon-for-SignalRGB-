@@ -125,9 +125,22 @@ SignalRGB-Benachrichtigung:
 
 Nur als SignalRGB-Benachrichtigung (das Display kann sie in diesen Fällen nicht zeigen):
 
+* **Display antwortet nicht**: SignalRGB erkennt das Gerät, das Display antwortet aber nicht. Meist fehlt der
+  WinUSB-Treiber (Schritt 2) oder die Hersteller-App belegt das Display.
 * **Verbindung zum Display unterbrochen**: USB-Übertragung fehlgeschlagen; das Plugin verbindet sich automatisch neu.
 * **Nicht unterstütztes Display**: Hinter `33C3:7788`, einer generischen Demo-ID, steckt ein Display mit anderer
   Auflösung. Das Plugin sendet dann bewusst keine Bilder.
+
+## Fehlersuche
+
+**SignalRGB zeigt „Jungle Leopard LCD“ an, das Display bleibt aber leer:** SignalRGB erkennt das Gerät schon
+ohne WinUSB-Treiber, weil es nur die USB-ID sieht. Senden kann es erst mit dem Treiber, also Schritt 2
+ausführen und SignalRGB über das Tray-Symbol beenden und neu starten.
+
+**Log:** Das Plugin schreibt alle Meldungen mit dem Präfix `[JL-LCD]` in die Gerätekonsole von SignalRGB und in
+SignalRGBs Logdatei (laut Community-Angaben unter `%LOCALAPPDATA%\WhirlwindFX\SignalRgb\Logs\`). Beim Start steht
+dort, was die USB-Aufrufe zurückgeben, z. B. `First bulk write returned: …` und `Panel check: …`. Diese Zeilen
+helfen bei der Fehlersuche.
 
 ## Rückgängig machen
 

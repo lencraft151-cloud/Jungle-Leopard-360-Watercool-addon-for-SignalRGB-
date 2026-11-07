@@ -31,7 +31,7 @@ messageLanguage:readonly
 shutdownBehavior:readonly
 */
 
-const PLUGIN_VERSION = "1.0.0";
+const PLUGIN_VERSION = "1.0.1";
 
 export function Name() { return "Jungle Leopard LCD"; }
 export function VendorId() { return 0x33C3; }
@@ -233,8 +233,18 @@ function codedError(code, message) {
 	return error;
 }
 
+/** Plugin messages go to the device console and, via toFile, to SignalRGB's log file. Never called per frame. */
 function log(message) {
-	device.log(`[JL-LCD] ${message}`);
+	device.log(`[JL-LCD] ${message}`, { toFile: true });
+}
+
+/** Short, log-friendly description of whatever a SignalRGB I/O call returned. */
+function describeResult(result) {
+	if (isByteArray(result)) {
+		return `array(${result.length})`;
+	}
+
+	return result === undefined ? "undefined" : `${typeof result} ${String(result)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -327,6 +337,13 @@ function extractReply(buffer) {
 class PanelLink {
 	constructor() {
 		this.lastKeepAlive = 0;
+		this.resetDiagnostics();
+	}
+
+	resetDiagnostics() {
+		this.firstWriteResult = "none";
+		this.lineResults = [];
+		this.infoBytesReceived = 0;
 	}
 
 	write(bytes) {
@@ -338,7 +355,16 @@ class PanelLink {
 				chunk[i] = bytes[offset + i];
 			}
 
-			device.bulk_transfer(USB.EP_OUT, chunk, length);
+			const result = device.bulk_transfer(USB.EP_OUT, chunk, length);
+
+			if (this.firstWriteResult === "none") {
+				this.firstWriteResult = describeResult(result);
+			}
+
+			// libusb reports failures as negative error codes (e.g. -12 = not supported by the bound driver).
+			if (typeof result === "number" && result < 0) {
+				throw codedError("usb-write", `USB write error ${result}`);
+			}
 		}
 	}
 
@@ -351,9 +377,10 @@ class PanelLink {
 
 		for (const [label, request, value, data] of requests) {
 			try {
-				device.control_transfer(0x21, request, value, USB.COMM_INTERFACE, data, data.length, 1000);
+				const result = device.control_transfer(0x21, request, value, USB.COMM_INTERFACE, data, data.length, 1000);
+				this.lineResults.push(`${label}: ${describeResult(result)}`);
 			} catch (e) {
-				log(`CDC ${label} request failed (continuing): ${e && e.message ? e.message : e}`);
+				this.lineResults.push(`${label}: failed (${e && e.message ? e.message : e})`);
 			}
 		}
 	}
@@ -410,6 +437,7 @@ class PanelLink {
 			}
 
 			const received = isByteArray(chunk) ? chunk.length : 0;
+			this.infoBytesReceived += received;
 
 			for (let i = 0; i < received; i++) {
 				buffer.push(chunk[i] & 0xFF);
@@ -1596,11 +1624,29 @@ const MESSAGES = {
 		priority: 1,
 		de: {
 			title: "Verbindung zum Display unterbrochen",
-			body: "Die USB-Übertragung ist fehlgeschlagen ({detail}). Das Plugin versucht, die Verbindung wiederherzustellen.",
+			body: "Die USB-Übertragung ist fehlgeschlagen ({detail}). Ist der WinUSB-Treiber eingerichtet " +
+				"(Zadig, Anleitung Schritt 2)? Das Plugin versucht, die Verbindung wiederherzustellen.",
 		},
 		en: {
 			title: "Lost connection to the display",
-			body: "The USB transfer failed ({detail}). The plugin is trying to reconnect.",
+			body: "The USB transfer failed ({detail}). Is the WinUSB driver installed (Zadig, setup step 2)? " +
+				"The plugin is trying to reconnect.",
+		},
+	},
+	PANEL_NO_REPLY: {
+		severity: "warning",
+		priority: 1,
+		de: {
+			title: "Display antwortet nicht",
+			body: "SignalRGB hat das Display erkannt, bekommt aber keine Antwort. Meist fehlt der WinUSB-Treiber " +
+				"(Zadig, Anleitung Schritt 2) oder die Hersteller-App belegt das Display noch. Zeigt das Display " +
+				"trotzdem ein Bild, kann diese Meldung ignoriert werden.",
+		},
+		en: {
+			title: "Display does not respond",
+			body: "SignalRGB detected the display but gets no answer. Usually the WinUSB driver is missing " +
+				"(Zadig, setup step 2) or the vendor app still holds the display. If the display shows a picture " +
+				"anyway, this message can be ignored.",
 		},
 	},
 };
@@ -1959,6 +2005,8 @@ function createState() {
 		lastSendAt: 0,
 		lastHash: 0,
 		framesSent: 0,
+		lastPipelineError: "",
+		lastReconnectError: "",
 	};
 }
 
@@ -2045,7 +2093,11 @@ function tryRecover(now) {
 		alerts.clear("link");
 		log("Connection to the panel restored.");
 	} catch (e) {
-		log(`Reconnect failed: ${errorText(e)}`);
+		// Retried every few seconds: only log when the reason changes.
+		if (errorText(e) !== state.lastReconnectError) {
+			log(`Reconnect failed: ${errorText(e)}`);
+			state.lastReconnectError = errorText(e);
+		}
 	}
 }
 
@@ -2059,19 +2111,37 @@ function identifyPanel() {
 		log(`Panel info: ${state.panelInfo.raw}`);
 	}
 
-	log(`Panel check: ${verdict.status} (${verdict.reason}).`);
+	log(`Panel check: ${verdict.status} (${verdict.reason}), ${link.infoBytesReceived} bytes received.`);
 
 	return verdict;
+}
+
+/** One-time diagnostics, so a log from a real machine shows how SignalRGB's USB layer behaves. */
+function logStartupDiagnostics() {
+	if (typeof device.getDeviceInfo === "function") {
+		try {
+			log(`USB device: ${JSON.stringify(device.getDeviceInfo())}`);
+		} catch (e) {
+			log(`USB device info unavailable: ${errorText(e)}`);
+		}
+	}
+
+	log(`CDC line setup: ${link.lineResults.join("; ") || "not run"}. First bulk write returned: ${link.firstWriteResult}.`);
 }
 
 export function Initialize() {
 	state = createState();
 	alerts.clearAll();
+	link.resetDiagnostics();
 	log(`Plugin ${PLUGIN_VERSION} starting.`);
+
+	let diagnosticsLogged = false;
 
 	try {
 		link.openLine();
 		link.flush();
+		logStartupDiagnostics();
+		diagnosticsLogged = true;
 
 		const verdict = identifyPanel();
 
@@ -2081,8 +2151,17 @@ export function Initialize() {
 			return;
 		}
 
+		if (verdict.reason === "no-reply") {
+			alerts.raiseMessage("panel", "PANEL_NO_REPLY", state.settings.language, "");
+		}
+
 		enterLive();
 	} catch (e) {
+		if (!diagnosticsLogged) {
+			logStartupDiagnostics();
+		}
+
+		log(`Panel start failed: ${errorText(e)}`);
 		onLinkError(e, Date.now());
 	}
 
@@ -2108,7 +2187,10 @@ function produceFrame(now) {
 	try {
 		return pipeline.next(state.settings, now);
 	} catch (e) {
-		log(`Frame pipeline error: ${errorText(e)}`);
+		if (errorText(e) !== state.lastPipelineError) {
+			log(`Frame pipeline error: ${errorText(e)}`);
+			state.lastPipelineError = errorText(e);
+		}
 
 		return pipeline.statusFrame("RENDER_ERROR", errorText(e), state.settings);
 	}

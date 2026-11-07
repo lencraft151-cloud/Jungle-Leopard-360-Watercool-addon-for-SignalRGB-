@@ -289,13 +289,62 @@ test("a different display behind the generic 33C3:7788 ID is left alone", () => 
 	assert.equal(ctx.panel.controls(0x11).length, 0);
 });
 
-test("a panel that does not answer the info request still works", () => {
+test("a panel that does not answer the info request still works, but the user is told why it may not", () => {
 	const ctx = boot({ panel: { answerInfo: false } });
 	run(ctx, 200);
 
 	assert.equal(I.getState().panelInfo, null);
 	assert.ok(ctx.panel.images().length >= 1);
+
+	const alert = ctx.dev.activeAlerts().find((a) => a.title === "Display antwortet nicht");
+	assert.ok(alert, "no-reply warning");
+	assert.ok(alert.description.includes("WinUSB"));
 	assertCleanStream(ctx.panel);
+});
+
+test("startup diagnostics end up in the log file", () => {
+	const ctx = boot();
+
+	const lines = ctx.dev.logs.join("\n");
+	assert.match(lines, /USB device: \{"vid":13251,"pid":30600/);
+	assert.match(lines, /CDC line setup: line coding: array\(0\); DTR\/RTS: array\(0\)\. First bulk write returned: array\(0\)\./);
+	assert.match(lines, /Panel check: ok \(model\), \d+ bytes received\./);
+});
+
+test("detected but blocked by the Windows serial driver: a clear alert instead of a silent blank display", () => {
+	LCD.reset();
+	LCD.frameProvider = faceProvider();
+
+	const clock = installClock();
+	const panel = new FakePanel();
+	const dev = installDevice(panel, clock, { writeErrorCode: -12 });
+	setProperties(DEFAULT_PROPS);
+	Plugin.Initialize();
+
+	for (let t = 0; t < 7000; t += 33) {
+		Plugin.Render();
+		clock.advance(33);
+	}
+
+	const alert = dev.activeAlerts().find((a) => a.title === "Verbindung zum Display unterbrochen");
+	assert.ok(alert, `alerts: ${dev.activeAlerts().map((a) => a.title)}`);
+	assert.ok(alert.description.includes("USB write error -12"));
+	assert.ok(alert.description.includes("WinUSB"));
+	assert.ok(dev.logs.some((l) => l.includes("First bulk write returned: number -12")));
+	assert.equal(dev.logs.filter((l) => l.includes("Reconnect failed")).length, 1, "retries are not logged every time");
+	assert.equal(panel.events.length, 0);
+
+	// Once the driver is fixed, the plugin recovers by itself.
+	dev.writeErrorCode = 0;
+
+	for (let t = 0; t < 3000; t += 33) {
+		Plugin.Render();
+		clock.advance(33);
+	}
+
+	assert.ok(!dev.activeAlerts().some((a) => a.title === "Verbindung zum Display unterbrochen"));
+	assert.ok(panel.images().length >= 1);
+	assertCleanStream(panel);
 });
 
 test("shutdown releases the panel; Close (0x21) only on firmware 3.1+, backlight off on request", () => {

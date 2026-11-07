@@ -127,7 +127,11 @@ Format unbekannt, läuft es normal weiter.
 * **Hardwaretest ausstehend.** Getestet wurde gegen einen Protokoll-Simulator; die gesendeten Bilder wurden
   unabhängig mit libjpeg dekodiert.
 * **WinUSB-Voraussetzung:** Geschlossen aus der Plugin-API (kein serieller Transport, `rawusb` = libusb) und der
-  SignalRGB-Dokumentation („USB“/„libusb“-Geräteklasse = rawusb). Ein Test mit SignalRGB selbst steht aus.
+  SignalRGB-Dokumentation („USB“/„libusb“-Geräteklasse = rawusb). Erste Rückmeldung vom echten System: SignalRGB
+  erkennt das Gerät auch **ohne** WinUSB, das Display bleibt dann aber leer. Das passt dazu, dass libusb unter
+  Windows alle Geräte auflistet, Geräte am seriellen Treiber aber nicht öffnen kann. Seit Version 1.0.1
+  protokolliert das Plugin beim Start die Rückgabewerte der USB-Aufrufe, wertet negative libusb-Fehlercodes als
+  Fehler und meldet „Display antwortet nicht“, wenn keine Antwort auf die Geräteinfo kommt.
 * **`Validate` bei `rawusb`:** Offizielle Raw-USB-Plugins exportieren kein `Validate`. Dieses Plugin gibt
   Interface 0 und 1 frei, weil die Bulk-Endpunkte auf Interface 1 liegen. Falls SignalRGB nur Interface 0
   beansprucht, scheitern die Bulk-Transfers. Das Plugin meldet das dann als „Verbindung zum Display unterbrochen“.
