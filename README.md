@@ -86,8 +86,10 @@ ansprechen kann, braucht es den Windows-eigenen **WinUSB**-Treiber:
    Zadig nicht.
 3. [Zadig](https://zadig.akeo.ie/) herunterladen und starten (keine Installation nötig, Admin-Abfrage bestätigen).
 4. Menü *Options* → **List All Devices** anhaken.
-5. In der Auswahlliste den Eintrag mit dem Namen aus Schritt 2 wählen und prüfen, dass in den USB-ID-Feldern
-   darunter **`33C3`** und **`7788`** stehen. Stehen dort andere Werte: falscher Eintrag, nicht ersetzen.
+5. In der Auswahlliste den Eintrag des Displays wählen. Zadig zeigt den Namen, den das Gerät selbst meldet, nicht
+   den aus dem Geräte-Manager; bei einem Nutzer hieß das Display dort **„MONITOR“**. Bei jedem Kandidaten in den
+   USB-ID-Feldern darunter nachsehen: Nur bei **`33C3`** und **`7788`** (Treiber links: *usbser*) ist es das
+   Display. Stehen dort andere Werte: falscher Eintrag, nicht ersetzen.
 6. Rechts neben dem grünen Pfeil **WinUSB** auswählen → **Replace Driver** → warten, bis Zadig „successfully“ meldet.
 7. SignalRGB beenden (Rechtsklick aufs Tray-Symbol → Quit) und neu starten.
 
