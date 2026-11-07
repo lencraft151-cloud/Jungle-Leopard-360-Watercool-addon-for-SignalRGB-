@@ -112,8 +112,9 @@ test("exports satisfy SignalRGB's plugin validator rules", () => {
 		}
 	}
 
-	assert.equal(Plugin.Validate({ interface: 1 }), true, "CDC data interface");
-	assert.equal(Plugin.Validate({ interface: 0 }), true, "CDC communication interface");
+	assert.equal(Plugin.Validate({ interface: 1 }), true, "CDC data interface (bulk endpoints)");
+	assert.equal(Plugin.Validate({ interface: -1 }), true, "device without interface number");
+	assert.equal(Plugin.Validate({ interface: 0 }), false, "must not become the active endpoint");
 	assert.equal(Plugin.Validate({ interface: 2 }), false);
 });
 
@@ -316,13 +317,12 @@ test("a panel that does not answer the info request still works, but the user is
 
 test("startup diagnosis: shown as a notification and written to the log file", () => {
 	const ctx = boot();
-	const text = "Plugin 1.0.2 | Validate: ";
 	const report = diagnosis(ctx.dev);
 
 	assert.ok(report, "diagnosis notification");
 	assert.equal(report.title, "Jungle Leopard LCD - Diagnose");
 	assert.equal(report.priority, 0);
-	assert.ok(report.description.startsWith(text));
+	assert.match(report.description, /^Plugin \d+\.\d+\.\d+ \| Validate: /);
 
 	for (const part of [
 		"USB: if0 cls 0x02 [0x83 int]; if1 cls 0x0a [0x02 bulk, 0x81 bulk]",
@@ -372,6 +372,60 @@ test("endpoints are taken from the device's own USB descriptor", () => {
 	assertCleanStream(panel);
 });
 
+function bootWith(deviceOptions, props = {}) {
+	LCD.reset();
+	LCD.frameProvider = faceProvider();
+
+	const clock = installClock();
+	const panel = new FakePanel();
+	panel.clock = clock;
+
+	const dev = installDevice(panel, clock, deviceOptions);
+	setProperties({ ...DEFAULT_PROPS, ...props });
+	Plugin.Initialize();
+
+	for (let t = 0; t < 300; t += 33) {
+		Plugin.Render();
+		clock.advance(33);
+	}
+
+	return { clock, panel, dev };
+}
+
+test("reported hardware: bulk_transfer returns array(-1), so the plugin switches to SignalRGB's write/read", () => {
+	const descriptor = cdcConfigDescriptor({ epInt: 0x81, epOut: 0x01, epIn: 0x82 });
+	const { panel, dev } = bootWith({ epOut: 0x01, epIn: 0x82, descriptor, bulkBroken: true });
+	const report = diagnosis(dev).description;
+
+	assert.ok(panel.images().length >= 1, "frames reach the panel");
+	assert.ok(I.getState().panelInfo, "the info reply arrives via read()");
+	assert.ok(report.includes("Write: array(-1)"), report);
+	assert.ok(report.includes("Probe: bulk: USB write error -1; write/bulk: read error; write/read: reply"), report);
+	assert.ok(report.includes("Transport: write/read"), report);
+	assert.deepEqual(activeTitles(dev), []);
+	assertCleanStream(panel);
+});
+
+test("the data interface is made the active endpoint when SignalRGB lists it", () => {
+	const hidEndpoints = [
+		{ interface: 0, usage: 0, usage_page: 0, collection: 0 },
+		{ interface: 1, usage: 0, usage_page: 0, collection: 0 },
+	];
+	const { dev } = bootWith({ hidEndpoints });
+
+	assert.deepEqual(dev.setEndpointCalls, [{ iface: 1, usage: 0, usagePage: 0, collection: 0 }]);
+	assert.ok(diagnosis(dev).description.includes("Active: set_endpoint if1 (listed: 0,1)"));
+});
+
+test("when no USB path works at all, the user gets the connection alert with the probe results", () => {
+	const { panel, dev } = bootWith({ bulkBroken: true, genericBroken: true });
+	const alert = problemAlerts(dev).find((a) => a.title === "Verbindung zum Display unterbrochen");
+
+	assert.ok(alert, `alerts: ${activeTitles(dev)}`);
+	assert.ok(alert.description.includes("bulk: USB write error -1; write: LIBUSB_ERROR_IO"), alert.description);
+	assert.equal(panel.images().length, 0);
+});
+
 test("an unreadable descriptor falls back to the CherryUSB defaults and says so", () => {
 	LCD.reset();
 	LCD.frameProvider = faceProvider();
@@ -408,7 +462,7 @@ test("detected but blocked by the Windows serial driver: a clear alert instead o
 	assert.ok(alert.description.includes("USB write error -12"));
 	assert.ok(alert.description.includes("WinUSB"));
 	assert.ok(dev.logs.some((l) => l.includes("Write: number -12")));
-	assert.ok(diagnosis(dev).description.includes("Error: USB write error -12"));
+	assert.ok(diagnosis(dev).description.includes("Error: bulk: USB write error -12; write: USB write error -12"));
 	assert.equal(dev.logs.filter((l) => l.includes("Reconnect failed")).length, 1, "retries are not logged every time");
 	assert.equal(panel.events.length, 0);
 

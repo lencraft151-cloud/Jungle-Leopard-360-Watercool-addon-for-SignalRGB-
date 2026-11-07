@@ -132,9 +132,15 @@ Format unbekannt, läuft es normal weiter.
   Windows alle Geräte auflistet, Geräte am seriellen Treiber aber nicht öffnen kann. Seit Version 1.0.1
   protokolliert das Plugin beim Start die Rückgabewerte der USB-Aufrufe, wertet negative libusb-Fehlercodes als
   Fehler und meldet „Display antwortet nicht“, wenn keine Antwort auf die Geräteinfo kommt.
-* **`Validate` bei `rawusb`:** Offizielle Raw-USB-Plugins exportieren kein `Validate`. Dieses Plugin gibt
-  Interface 0 und 1 frei, weil die Bulk-Endpunkte auf Interface 1 liegen. Falls SignalRGB nur Interface 0
-  beansprucht, scheitern die Bulk-Transfers. Das Plugin meldet das dann als „Verbindung zum Display unterbrochen“.
+* **Befund am echten Gerät (Plugin 1.0.2):** Hardware-ID `USB\VID_33C3&PID_7788&REV_0200`, Zadig-Name
+  „MONITOR“, kein Composite-Gerät. Deskriptor: `if0 cls 0x02 [0x81 int]; if1 cls 0x0a [0x01 bulk, 0x82 bulk]`,
+  also **andere Endpunkte als das CherryUSB-Template** (OUT `0x01`, IN `0x82`). Mit WinUSB funktionierten
+  Control-Transfers (`line coding: array(7)`), jeder `bulk_transfer` lieferte aber `array(-1)`.
+* **`Validate` bei `rawusb`:** Laut SignalRGB-Doku öffnet `Validate()` Endpunkte, aktiv ist aber immer nur einer
+  (`device.set_endpoint()` wechselt). Bis 1.0.2 gab das Plugin Interface 0 und 1 frei; vermutlich war damit das
+  endpunktlose Interface 0 aktiv. Ab 1.0.3 wird nur Interface 1 freigegeben (wie im offiziellen ASUS-Ryuo-Plugin),
+  Interface 1 per `set_endpoint` aktiviert, sofern SignalRGB es auflistet, und beim Start werden `bulk_transfer`
+  sowie das generische `write`/`read` ausprobiert. Die Diagnose-Benachrichtigung zeigt das Ergebnis (`Probe:`).
 * **Feldnamen der Geräteinfo:** Nur der Modellstring ist bekannt; der Parser ist deshalb tolerant.
 
 ## Quellen

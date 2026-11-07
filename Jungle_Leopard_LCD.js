@@ -32,7 +32,7 @@ shutdownBehavior:readonly
 startupReport:readonly
 */
 
-const PLUGIN_VERSION = "1.0.2";
+const PLUGIN_VERSION = "1.0.3";
 
 export function Name() { return "Jungle Leopard LCD"; }
 export function VendorId() { return 0x33C3; }
@@ -120,15 +120,16 @@ export function ControllableParameters() {
 const offeredEndpoints = [];
 
 /**
- * The CDC communication interface (0) receives line-state control requests,
- * the CDC data interface (1) carries the bulk endpoints. Both must be claimed.
+ * Open only the CDC data interface (1): it carries the bulk endpoints. SignalRGB uses one opened endpoint
+ * at a time, and accepting interface 0 as well made the endpoint-less communication interface the active
+ * one, so every bulk transfer failed with -1 (seen on real hardware). -1 = device without interface number.
  */
 export function Validate(endpoint) {
 	if (offeredEndpoints.length < 16) {
 		offeredEndpoints.push(endpoint && endpoint.interface);
 	}
 
-	return endpoint.interface === -1 || endpoint.interface === 0 || endpoint.interface === 1;
+	return endpoint.interface === -1 || endpoint.interface === 1;
 }
 
 export function Image() {
@@ -156,6 +157,7 @@ const STATUS_QUALITY = 80;
 
 const USB = {
 	COMM_INTERFACE: 0,
+	DATA_INTERFACE: 1,
 	EP_OUT: 0x02,
 	EP_IN: 0x81,
 	CHUNK_BYTES: 4096,
@@ -405,6 +407,19 @@ function describeInterfaces(interfaces) {
 		`${iface.endpoints.map((e) => `${hex2(e.address)} ${kind[e.transfer]}`).join(", ")}]`).join("; ");
 }
 
+/** SignalRGB reports failed USB transfers as negative numbers or as arrays whose length is negative. */
+function transferError(result) {
+	if (typeof result === "number" && result < 0) {
+		return result;
+	}
+
+	return isByteArray(result) && result.length < 0 ? result.length : 0;
+}
+
+function messageOf(e) {
+	return e && e.message ? e.message : String(e);
+}
+
 class PanelLink {
 	constructor() {
 		this.lastKeepAlive = 0;
@@ -418,7 +433,12 @@ class PanelLink {
 		this.epOut = USB.EP_OUT;
 		this.epIn = USB.EP_IN;
 		this.commInterface = USB.COMM_INTERFACE;
+		this.dataInterface = USB.DATA_INTERFACE;
 		this.descriptorInfo = "not read";
+		this.endpointSelection = "not run";
+		this.transport = "bulk";
+		this.reader = "bulk";
+		this.probeResults = [];
 	}
 
 	/**
@@ -431,7 +451,7 @@ class PanelLink {
 		try {
 			raw = device.control_transfer(0x80, 0x06, 0x0200, 0x0000, [], 255, 1000);
 		} catch (e) {
-			this.descriptorInfo = `read failed (${e && e.message ? e.message : e})`;
+			this.descriptorInfo = `read failed (${messageOf(e)})`;
 
 			return;
 		}
@@ -450,10 +470,46 @@ class PanelLink {
 			this.epOut = picked.out;
 			this.epIn = picked.in;
 			this.commInterface = picked.commInterface;
+			this.dataInterface = picked.dataInterface;
 		}
 	}
 
-	write(bytes) {
+	/**
+	 * SignalRGB opens the endpoints Validate() accepted but uses only one at a time. Make the data
+	 * interface (the one with the bulk endpoints) the active one if SignalRGB lists it.
+	 */
+	selectDataEndpoint() {
+		let list = [];
+
+		try {
+			list = typeof device.getHidEndpoints === "function" ? device.getHidEndpoints() : [];
+		} catch (e) {
+			list = [];
+		}
+
+		const entries = isByteArray(list) ? Array.from(list) : [];
+		const match = entries.find((e) => e && e.interface === this.dataInterface);
+		const listed = entries.map((e) => (e ? e.interface : "?")).join(",") || "-";
+
+		if (!match || typeof device.set_endpoint !== "function") {
+			this.endpointSelection = `if${this.dataInterface} via Validate (listed: ${listed})`;
+
+			return;
+		}
+
+		try {
+			device.set_endpoint(match.interface, match.usage, match.usage_page, match.collection);
+			this.endpointSelection = `set_endpoint if${match.interface} (listed: ${listed})`;
+		} catch (e) {
+			this.endpointSelection = `set_endpoint failed: ${messageOf(e)} (listed: ${listed})`;
+		}
+	}
+
+	sendChunk(transport, chunk, length) {
+		return transport === "write" ? device.write(chunk, length) : device.bulk_transfer(this.epOut, chunk, length);
+	}
+
+	write(bytes, transport = this.transport) {
 		for (let offset = 0; offset < bytes.length; offset += USB.CHUNK_BYTES) {
 			const length = Math.min(USB.CHUNK_BYTES, bytes.length - offset);
 			const chunk = new Array(length);
@@ -462,17 +518,30 @@ class PanelLink {
 				chunk[i] = bytes[offset + i];
 			}
 
-			const result = device.bulk_transfer(this.epOut, chunk, length);
+			const result = this.sendChunk(transport, chunk, length);
 
 			if (this.firstWriteResult === "none") {
 				this.firstWriteResult = describeResult(result);
 			}
 
-			// libusb reports failures as negative error codes (e.g. -12 = not supported by the bound driver).
-			if (typeof result === "number" && result < 0) {
-				throw codedError("usb-write", `USB write error ${result}`);
+			// libusb error codes, e.g. -1 (I/O, endpoint not on the active interface) or -12 (driver not supported).
+			const error = transferError(result);
+
+			if (error) {
+				throw codedError("usb-write", `USB write error ${error}`);
 			}
 		}
+	}
+
+	/** Returns received bytes (possibly none), or null if the read itself failed. */
+	readChunk(reader) {
+		const data = reader === "read" ? device.read([], USB.READ_BYTES, 50) : device.bulk_transfer(this.epIn, [], USB.READ_BYTES);
+
+		if (transferError(data)) {
+			return null;
+		}
+
+		return isByteArray(data) ? data : [];
 	}
 
 	/** CDC SET_LINE_CODING (115200 8N1) and SET_CONTROL_LINE_STATE (DTR + RTS), as the vendor app does. */
@@ -487,16 +556,16 @@ class PanelLink {
 				const result = device.control_transfer(0x21, request, value, this.commInterface, data, data.length, 1000);
 				this.lineResults.push(`${label}: ${describeResult(result)}`);
 			} catch (e) {
-				this.lineResults.push(`${label}: failed (${e && e.message ? e.message : e})`);
+				this.lineResults.push(`${label}: failed (${messageOf(e)})`);
 			}
 		}
 	}
 
 	/** JPEG end-of-image markers flush a half-received frame, then four zero bytes (vendor app sequence). */
-	flush() {
-		this.write([0xFF, 0xD9, 0xFF, 0xD9]);
+	flush(transport = this.transport) {
+		this.write([0xFF, 0xD9, 0xFF, 0xD9], transport);
 		device.pause(50);
-		this.write([0x00, 0x00, 0x00, 0x00]);
+		this.write([0x00, 0x00, 0x00, 0x00], transport);
 		device.pause(200);
 	}
 
@@ -525,9 +594,13 @@ class PanelLink {
 		this.write(buildImageEnvelope(avoidMagicCollision(jpeg)));
 	}
 
-	/** Sends 0x06 and collects the JSON reply from the bulk IN endpoint. Returns null without a reply. */
-	queryInfo(timeoutMs) {
-		this.sendCommand(CMD.GET_INFO);
+	/** Sends 0x06 via `transport` and collects the JSON reply via `reader`. */
+	requestInfo(transport, reader, timeoutMs) {
+		try {
+			this.write(buildControlFrame(CMD.GET_INFO), transport);
+		} catch (e) {
+			return { reply: null, note: `write failed (${messageOf(e)})` };
+		}
 
 		const deadline = Date.now() + timeoutMs;
 		const buffer = [];
@@ -536,30 +609,72 @@ class PanelLink {
 			let chunk;
 
 			try {
-				chunk = device.bulk_transfer(this.epIn, [], USB.READ_BYTES);
+				chunk = this.readChunk(reader);
 			} catch (e) {
-				log(`Reading the device info failed: ${e && e.message ? e.message : e}`);
-
-				return null;
+				return { reply: null, note: `read failed (${messageOf(e)})` };
 			}
 
-			const received = isByteArray(chunk) ? chunk.length : 0;
-			this.infoBytesReceived += received;
+			if (chunk === null) {
+				return { reply: null, note: "read error" };
+			}
 
-			for (let i = 0; i < received; i++) {
+			this.infoBytesReceived += chunk.length;
+
+			for (let i = 0; i < chunk.length; i++) {
 				buffer.push(chunk[i] & 0xFF);
 			}
 
 			const reply = extractReply(buffer);
 
 			if (reply) {
-				return reply;
+				return { reply, note: `reply ${buffer.length} B` };
 			}
 
-			if (received === 0) {
+			if (chunk.length === 0) {
 				device.pause(10);
 			}
 		}
+
+		return { reply: null, note: `no reply (${buffer.length} B)` };
+	}
+
+	/**
+	 * Finds a working way to talk to the panel: SignalRGB's bulk_transfer() on the discovered endpoints,
+	 * or its generic write()/read(), which use the active endpoint. The first combination that gets an
+	 * answer to the info request wins; otherwise the first one that could write at all.
+	 * Returns the info reply (or null). Throws if nothing can write.
+	 */
+	probe(timeoutMs) {
+		let writable = null;
+
+		for (const transport of ["bulk", "write"]) {
+			try {
+				this.flush(transport);
+			} catch (e) {
+				this.probeResults.push(`${transport}: ${messageOf(e)}`);
+				continue;
+			}
+
+			writable = writable || transport;
+
+			for (const reader of ["bulk", "read"]) {
+				const { reply, note } = this.requestInfo(transport, reader, timeoutMs);
+				this.probeResults.push(`${transport}/${reader}: ${note}`);
+
+				if (reply) {
+					this.transport = transport;
+					this.reader = reader;
+
+					return reply;
+				}
+			}
+		}
+
+		if (!writable) {
+			throw codedError("usb-write", this.probeResults.join("; "));
+		}
+
+		this.transport = writable;
 
 		return null;
 	}
@@ -2216,8 +2331,7 @@ function tryRecover(now) {
 	}
 }
 
-function identifyPanel() {
-	const reply = link.queryInfo(INFO_TIMEOUT_MS);
+function identifyPanel(reply) {
 	state.panelInfo = reply ? parseDeviceInfo(reply.text) : null;
 
 	const verdict = assessPanel(state.panelInfo);
@@ -2241,8 +2355,11 @@ function diagnosisText(failure) {
 		`Validate: ${offeredEndpoints.length ? offeredEndpoints.join(",") : "-"}`,
 		`USB: ${link.descriptorInfo}`,
 		`Endpoints: OUT ${hex2(link.epOut)} IN ${hex2(link.epIn)}, control if${link.commInterface}`,
+		`Active: ${link.endpointSelection}`,
 		`Line: ${link.lineResults.join("; ") || "-"}`,
 		`Write: ${link.firstWriteResult}`,
+		`Probe: ${link.probeResults.join("; ") || "-"}`,
+		`Transport: ${link.transport}/${link.reader}`,
 		`Reply: ${reply}`,
 	];
 
@@ -2277,12 +2394,12 @@ export function Initialize() {
 	link.resetDiagnostics();
 	log(`Plugin ${PLUGIN_VERSION} starting.`);
 	link.discoverEndpoints();
+	link.selectDataEndpoint();
 
 	try {
 		link.openLine();
-		link.flush();
 
-		const verdict = identifyPanel();
+		const verdict = identifyPanel(link.probe(INFO_TIMEOUT_MS));
 
 		if (verdict.status === "mismatch") {
 			alerts.raiseMessage("panel", "PANEL_MISMATCH", state.settings.language, verdict.reason);

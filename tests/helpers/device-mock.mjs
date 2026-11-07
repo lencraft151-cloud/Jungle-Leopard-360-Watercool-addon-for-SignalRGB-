@@ -36,6 +36,7 @@ export function cdcConfigDescriptor({ commInterface = 0, dataInterface = 1, epIn
 
 export function installDevice(panel, clock, {
 	failWrites = false, writeErrorCode = 0, epOut = 0x02, epIn = 0x81, descriptor = cdcConfigDescriptor(),
+	bulkBroken = false, genericBroken = false, hidEndpoints = null,
 } = {}) {
 	let alertCounter = 0;
 	const dev = {
@@ -43,6 +44,11 @@ export function installDevice(panel, clock, {
 		// Non-zero: writes return this libusb error code instead of throwing (e.g. -12 when the
 		// Windows serial driver still owns the device), and nothing reaches the panel.
 		writeErrorCode,
+		// As observed on real hardware when the wrong interface is active: every bulk_transfer()
+		// returns an array-like result with length -1.
+		bulkBroken,
+		genericBroken,
+		hidEndpoints,
 		epOut,
 		epIn,
 		descriptor,
@@ -50,30 +56,39 @@ export function installDevice(panel, clock, {
 		alerts: [],
 		controlTransfers: [],
 		bulkCalls: [],
+		setEndpointCalls: [],
 
 		getDeviceInfo() {
 			return { vid: 0x33C3, pid: 0x7788, manufacturer: "CherryUSB", product: "CherryUSB CDC DEMO", serial: "2022123456", type: "rawusb" };
 		},
 
+		toPanel(data, length) {
+			if (this.failWrites) {
+				throw new Error("LIBUSB_ERROR_NO_DEVICE");
+			}
+
+			if (this.writeErrorCode) {
+				return this.writeErrorCode;
+			}
+
+			if (data.length !== length) {
+				throw new Error(`length ${length} does not match data length ${data.length}`);
+			}
+
+			panel.receive(data);
+
+			return [];
+		},
+
 		bulk_transfer(endpoint, data, length) {
 			this.bulkCalls.push({ endpoint, length });
 
+			if (this.bulkBroken) {
+				return { length: -1 };
+			}
+
 			if (endpoint === this.epOut) {
-				if (this.failWrites) {
-					throw new Error("LIBUSB_ERROR_NO_DEVICE");
-				}
-
-				if (this.writeErrorCode) {
-					return this.writeErrorCode;
-				}
-
-				if (data.length !== length) {
-					throw new Error(`length ${length} does not match data length ${data.length}`);
-				}
-
-				panel.receive(data);
-
-				return [];
+				return this.toPanel(data, length);
 			}
 
 			if (endpoint === this.epIn) {
@@ -82,6 +97,31 @@ export function installDevice(panel, clock, {
 
 			// Like libusb: an endpoint the device does not have is an error.
 			throw new Error(`LIBUSB_ERROR_NOT_FOUND (endpoint 0x${endpoint.toString(16)})`);
+		},
+
+		// SignalRGB's generic write/read: for rawusb devices they use the active endpoint.
+		write(data, length) {
+			if (this.genericBroken) {
+				throw new Error("LIBUSB_ERROR_IO");
+			}
+
+			return this.toPanel(data, length);
+		},
+
+		read(data, length) {
+			if (this.genericBroken) {
+				return { length: -1 };
+			}
+
+			return panel.read(length);
+		},
+
+		getHidEndpoints() {
+			return this.hidEndpoints || [];
+		},
+
+		set_endpoint(iface, usage, usagePage, collection) {
+			this.setEndpointCalls.push({ iface, usage, usagePage, collection });
 		},
 
 		control_transfer(type, request, value, index, data, length, timeout) {
