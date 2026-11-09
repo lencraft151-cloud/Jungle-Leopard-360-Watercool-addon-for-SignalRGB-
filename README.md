@@ -97,6 +97,37 @@ auswählen und anpassen. Die Auswahl speichert SignalRGB selbst.
 kein Face gewählt, zeigt das Display nach etwa 1,5 Sekunden „Kein LCD-Face aktiv“. Diese Meldung kommt bereits
 vom Plugin, der Weg bis zum Display funktioniert also.
 
+## RGB-Beleuchtung der Wasserkühlung (Pumpe und Lüfter)
+
+Das Display und die RGB-Beleuchtung sind beim Jungle Leopard **zwei getrennte Systeme**:
+
+* Das **Display** hängt am internen USB-Anschluss. Nur darum kümmert sich dieses Plugin. Das Display-Protokoll
+  hat keinen einzigen Befehl für LEDs (vollständige Befehlsliste der Hersteller-App, siehe
+  [docs/signalrgb-lcd-integration.md](docs/signalrgb-lcd-integration.md)).
+* Die **Beleuchtung** von Pumpe und Lüftern ist normales **5V-ARGB mit 3-Pin-Stecker** („5V 3PIN ARGB“). Dieser
+  Stecker führt nur ein Datensignal **zu** den LEDs, nichts zurück. Deshalb kann **kein Programm** die
+  Beleuchtung „erkennen“, auch SignalRGB, iCUE oder die Mainboard-Software nicht. Das gilt für alle ARGB-Kühler.
+
+Steuern lässt sie sich trotzdem: über einen ARGB-Anschluss, den SignalRGB ansteuern kann.
+
+1. **PC ausschalten und Netzstecker ziehen.**
+2. Den ARGB-Stecker der Wasserkühlung (3 Kabel, eine Buchse ist zugestopft) auf einen **5V-ARGB-Anschluss des
+   Mainboards** stecken. Er heißt je nach Hersteller z. B. `JRAINBOW`/`JARGB_V2` (MSI), `ADD_GEN2`
+   (ASUS), `D_LED` (Gigabyte) oder `ADDR_LED` (ASRock) und hat **3 Pins** mit einer Lücke. Das
+   Mainboard-Handbuch zeigt, wo er sitzt.
+   **Nicht** auf einen 4-poligen 12V-RGB-Anschluss stecken (z. B. `JRGB`, `RGB_HEADER`, `LED_C`): Das zerstört
+   die LEDs.
+3. Haben Pumpe und Lüfter **zwei getrennte ARGB-Stecker**, am besten jeden auf einen eigenen ARGB-Anschluss
+   stecken. Mit einem Y-Verteiler zeigen beide dasselbe Muster.
+4. In SignalRGB unter **Geräte** das **Mainboard** öffnen. Dort gibt es pro ARGB-Anschluss einen Kanal. Beim
+   Kanal der Wasserkühlung **Komponente hinzufügen** wählen. Gibt es den Kühler nicht in der Liste, eine
+   **LED-Leiste mit passender LED-Anzahl** anlegen. Danach lassen sich Pumpe und Lüfter im Layout frei
+   anordnen und wie jedes andere Gerät steuern.
+
+Erscheint das Mainboard in SignalRGB nicht oder ohne ARGB-Kanäle, unterstützt SignalRGB dessen ARGB-Anschlüsse
+nicht. Dann braucht es einen USB-ARGB-Controller, den SignalRGB unterstützt. Das Gehäuse-Hub mit Fernbedienung
+bzw. Taste kann SignalRGB in der Regel nicht ansteuern, weil es keine USB-Verbindung hat.
+
 ## Einstellungen
 
 In SignalRGB unter den Geräteeinstellungen von „Jungle Leopard LCD“:
