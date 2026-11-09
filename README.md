@@ -128,6 +128,50 @@ Erscheint das Mainboard in SignalRGB nicht oder ohne ARGB-Kanäle, unterstützt 
 nicht. Dann braucht es einen USB-ARGB-Controller, den SignalRGB unterstützt. Das Gehäuse-Hub mit Fernbedienung
 bzw. Taste kann SignalRGB in der Regel nicht ansteuern, weil es keine USB-Verbindung hat.
 
+## Mehrere Effekte gleichzeitig: Effekt „Zonen-Mix“
+
+SignalRGB spielt immer **einen** Effekt über alle Geräte. Jedes Gerät zeigt den Teil der Leinwand, auf dem es im
+Layout liegt. Verschiedene Effekte pro Gerät sind deshalb nicht vorgesehen. Bisher blieben nur die Malen-Funktion
+(statisch) oder eine Farbe für alles. **Zonen-Mix** ([`Effects/Zonen-Mix.html`](Effects/Zonen-Mix.html)) teilt die
+Leinwand in bis zu 4 Zonen, und jede Zone hat ihren **eigenen animierten Effekt** mit eigenen Farben, eigenem Tempo
+und eigener Helligkeit. So läuft z. B. auf der Wasserkühlung ein Regenbogen-Rad und auf den Gehäuselüftern
+gleichzeitig ein langsames Atmen in Lila.
+
+![Zonen-Mix: links die Zonen-Anzeige zum Einrichten, in der Mitte vier Zonen mit Regenbogen-Rad, Drehen, Verlauf und Funkeln, rechts Regenbogen-Rad neben Lauflicht](docs/zonen-mix-preview.png)
+
+| Einstellung | Wirkung |
+|---|---|
+| **Zonen-Aufteilung** | 1 Zone, 2/3/4 nebeneinander, 2/3 untereinander oder 2 × 2 Raster |
+| **Zonen anzeigen** | Zeigt Rahmen und Nummern der Zonen. Nur zum Einrichten, danach ausschalten. |
+| **Zone 1–4: Effekt** | *Regenbogen-Welle*, *Regenbogen-Rad* (dreht sich um die Zonenmitte, ideal für Lüfter und Pumpe), *Farbwechsel*, *Atmen*, *Statisch*, *Verlauf*, *Lauflicht*, *Drehen* (zwei Farben drehen sich), *Funkeln*, *Aus* |
+| **Zone 1–4: Farbe 1 / Farbe 2** | Farben des Effekts. Bei *Atmen*, *Lauflicht* und *Funkeln* ist Farbe 2 der Hintergrund (Schwarz = aus). |
+| **Zone 1–4: Tempo** | −10 bis 10. 0 = steht still, negativ = andere Richtung. |
+| **Zone 1–4: Helligkeit** | 0–100 % pro Zone, z. B. Gehäuselüfter dunkler als die Pumpe. |
+
+**Installieren:** Erscheint „Zonen-Mix“ nach dem Neustart von SignalRGB nicht schon von selbst bei den Effekten,
+Windows-Taste + X → *Terminal* öffnen und diese Zeile einfügen:
+
+```powershell
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072; $d = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'WhirlwindFX\Effects'; New-Item -ItemType Directory -Force -Path $d | Out-Null; Invoke-WebRequest -UseBasicParsing -Uri 'https://raw.githubusercontent.com/lencraft151-cloud/Jungle-Leopard-360-Watercool-addon-for-SignalRGB-/HEAD/Effects/Zonen-Mix.html' -OutFile (Join-Path $d 'Zonen-Mix.html')
+```
+
+Das speichert die Datei nach `Dokumente\WhirlwindFX\Effects\Zonen-Mix.html`, auch wenn der Ordner „Dokumente“
+in OneDrive liegt. Von Hand geht es genauso: Datei herunterladen und dorthin kopieren. Danach SignalRGB neu
+starten.
+
+**Einrichten:**
+
+1. In SignalRGB den Effekt **Zonen-Mix** auswählen und **Zonen anzeigen** einschalten.
+2. **Zonen-Aufteilung** wählen, z. B. *2 nebeneinander*.
+3. Unter **Layouts** die Geräte auf der Leinwand in ihre Zone ziehen und passend groß ziehen, z. B. die Komponente
+   der Wasserkühlung in Zone 1 und die Gehäuselüfter in Zone 2. Für *Regenbogen-Rad* und *Drehen* einen Lüfter
+   bzw. die Pumpe möglichst in die Mitte seiner Zone legen.
+4. Für jede Zone Effekt, Farben, Tempo und Helligkeit einstellen.
+5. **Zonen anzeigen** wieder ausschalten.
+
+Voraussetzung ist, dass SignalRGB die Geräte steuern kann, die Wasserkühlung also an einem unterstützten
+ARGB-Anschluss hängt (siehe oben).
+
 ## Einstellungen
 
 In SignalRGB unter den Geräteeinstellungen von „Jungle Leopard LCD“:
@@ -223,6 +267,9 @@ python3 tests/crosscheck/pillow_crosscheck.py   # optional, braucht Pillow
   jeden gesendeten Byte-Strom, prüft alle Prüfsummen und dass jedes Bild ein 960×480-Baseline-JPEG mit 4:2:0 und
   ≤ 80 KB ist. Dazu: belegter Port, abgestecktes Display, Teil-Schreibvorgänge, fehlendes Serial-Modul,
   Display an/aus.
+* `tests/effect.test.mjs`: der Effekt **Zonen-Mix** in einer Sandbox mit nachgebildetem Canvas: Zonen-Zuordnung
+  aller Aufteilungen, jede Effektart, Richtung, Helligkeit pro Zone, Zonen-Anzeige und dass die Regler
+  (`<meta>`-Tags) zu den Standardwerten im Code passen. In Headless-Chromium rendert ein Bild in unter 1 ms.
 * `tests/crosscheck/`: dekodiert die tatsächlich gesendeten Bilder für alle Layouts und Ausrichtungen mit
   Pillow/libjpeg und prüft Lage und Farbe von Orientierungsmarken.
 * Die Regeln des offiziellen SignalRGB-Plugin-Validators sind in den Tests nachgebildet. Der Code hält die

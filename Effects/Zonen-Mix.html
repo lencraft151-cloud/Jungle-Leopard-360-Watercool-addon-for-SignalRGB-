@@ -1,0 +1,384 @@
+<head>
+	<title>Zonen-Mix</title>
+	<meta description="Bis zu 4 Zonen mit je eigenem animierten Effekt, eigenen Farben, Tempo und Helligkeit. Geraete im Layout in die Zonen ziehen (zum Einrichten 'Zonen anzeigen' einschalten). Up to 4 zones, each with its own animated effect."/>
+	<meta publisher="lencraft151-cloud"/>
+	<meta property="zoneLayout" label="Zonen-Aufteilung" type="combobox" values="1 Zone,2 nebeneinander,3 nebeneinander,4 nebeneinander,2 untereinander,3 untereinander,2 x 2 Raster" default="2 nebeneinander"/>
+	<meta property="showZones" label="Zonen anzeigen (zum Einrichten)" tooltip="Zeigt Rahmen und Nummern der Zonen, damit du die Geraete im Layout richtig platzieren kannst. Danach wieder ausschalten." type="boolean" default="0"/>
+
+	<meta property="z1Effect" label="Zone 1: Effekt" type="combobox" values="Regenbogen-Welle,Regenbogen-Rad,Farbwechsel,Atmen,Statisch,Verlauf,Lauflicht,Drehen,Funkeln,Aus" default="Regenbogen-Rad"/>
+	<meta property="z1Color1" label="Zone 1: Farbe 1" type="color" min="0" max="360" default="#00b3ff"/>
+	<meta property="z1Color2" label="Zone 1: Farbe 2" type="color" min="0" max="360" default="#000000"/>
+	<meta property="z1Speed" label="Zone 1: Tempo" tooltip="0 = steht, negativ = andere Richtung" type="number" min="-10" max="10" default="4"/>
+	<meta property="z1Brightness" label="Zone 1: Helligkeit" type="number" min="0" max="100" default="100"/>
+
+	<meta property="z2Effect" label="Zone 2: Effekt" type="combobox" values="Regenbogen-Welle,Regenbogen-Rad,Farbwechsel,Atmen,Statisch,Verlauf,Lauflicht,Drehen,Funkeln,Aus" default="Atmen"/>
+	<meta property="z2Color1" label="Zone 2: Farbe 1" type="color" min="0" max="360" default="#7a00ff"/>
+	<meta property="z2Color2" label="Zone 2: Farbe 2" type="color" min="0" max="360" default="#000000"/>
+	<meta property="z2Speed" label="Zone 2: Tempo" tooltip="0 = steht, negativ = andere Richtung" type="number" min="-10" max="10" default="3"/>
+	<meta property="z2Brightness" label="Zone 2: Helligkeit" type="number" min="0" max="100" default="100"/>
+
+	<meta property="z3Effect" label="Zone 3: Effekt" type="combobox" values="Regenbogen-Welle,Regenbogen-Rad,Farbwechsel,Atmen,Statisch,Verlauf,Lauflicht,Drehen,Funkeln,Aus" default="Verlauf"/>
+	<meta property="z3Color1" label="Zone 3: Farbe 1" type="color" min="0" max="360" default="#ff0040"/>
+	<meta property="z3Color2" label="Zone 3: Farbe 2" type="color" min="0" max="360" default="#ff9900"/>
+	<meta property="z3Speed" label="Zone 3: Tempo" tooltip="0 = steht, negativ = andere Richtung" type="number" min="-10" max="10" default="3"/>
+	<meta property="z3Brightness" label="Zone 3: Helligkeit" type="number" min="0" max="100" default="100"/>
+
+	<meta property="z4Effect" label="Zone 4: Effekt" type="combobox" values="Regenbogen-Welle,Regenbogen-Rad,Farbwechsel,Atmen,Statisch,Verlauf,Lauflicht,Drehen,Funkeln,Aus" default="Funkeln"/>
+	<meta property="z4Color1" label="Zone 4: Farbe 1" type="color" min="0" max="360" default="#ffffff"/>
+	<meta property="z4Color2" label="Zone 4: Farbe 2" type="color" min="0" max="360" default="#001a33"/>
+	<meta property="z4Speed" label="Zone 4: Tempo" tooltip="0 = steht, negativ = andere Richtung" type="number" min="-10" max="10" default="5"/>
+	<meta property="z4Brightness" label="Zone 4: Helligkeit" type="number" min="0" max="100" default="100"/>
+</head>
+
+<body style="margin: 0; padding: 0; background: #000;">
+	<canvas id="exCanvas" width="320" height="200"></canvas>
+</body>
+
+<script>
+	/*
+	 * Zonen-Mix for SignalRGB: SignalRGB plays one effect over the whole canvas, and every device shows the part
+	 * of the canvas it is placed on. This effect splits the canvas into zones and runs a separate animation in
+	 * each, so devices placed in different zones get different effects at the same time.
+	 */
+	const canvas = document.getElementById("exCanvas");
+	const ctx = canvas.getContext("2d");
+	const WIDTH = canvas.width;
+	const HEIGHT = canvas.height;
+	const BLOCK = 2;                       // pixels are computed in 2x2 blocks: plenty for LED sampling
+	const COLS = Math.ceil(WIDTH / BLOCK);
+	const ROWS = Math.ceil(HEIGHT / BLOCK);
+	const TAU = Math.PI * 2;
+
+	const EFFECTS = ["Regenbogen-Welle", "Regenbogen-Rad", "Farbwechsel", "Atmen", "Statisch", "Verlauf", "Lauflicht", "Drehen", "Funkeln", "Aus"];
+	const LAYOUTS = {
+		"1 Zone": [[0, 0, 1, 1]],
+		"2 nebeneinander": columns(2),
+		"3 nebeneinander": columns(3),
+		"4 nebeneinander": columns(4),
+		"2 untereinander": rows(2),
+		"3 untereinander": rows(3),
+		"2 x 2 Raster": [[0, 0, 0.5, 0.5], [0.5, 0, 1, 0.5], [0, 0.5, 0.5, 1], [0.5, 0.5, 1, 1]],
+	};
+	const DEFAULTS = {
+		layout: "2 nebeneinander",
+		zones: [
+			["Regenbogen-Rad", "#00b3ff", "#000000", 4, 100],
+			["Atmen", "#7a00ff", "#000000", 3, 100],
+			["Verlauf", "#ff0040", "#ff9900", 3, 100],
+			["Funkeln", "#ffffff", "#001a33", 5, 100],
+		],
+	};
+
+	function columns(n) {
+		const out = [];
+
+		for (let i = 0; i < n; i++) {
+			out.push([i / n, 0, (i + 1) / n, 1]);
+		}
+
+		return out;
+	}
+
+	function rows(n) {
+		const out = [];
+
+		for (let i = 0; i < n; i++) {
+			out.push([0, i / n, 1, (i + 1) / n]);
+		}
+
+		return out;
+	}
+
+	// SignalRGB provides each property as a global named after it. They are read with typeof guards, so the
+	// effect also runs (with defaults) before SignalRGB has set them.
+	function readProperties() {
+		const D = DEFAULTS.zones;
+
+		return {
+			layout: typeof zoneLayout === "undefined" ? DEFAULTS.layout : zoneLayout,
+			showZones: typeof showZones === "undefined" ? false : showZones,
+			zones: [
+				[
+					typeof z1Effect === "undefined" ? D[0][0] : z1Effect,
+					typeof z1Color1 === "undefined" ? D[0][1] : z1Color1,
+					typeof z1Color2 === "undefined" ? D[0][2] : z1Color2,
+					typeof z1Speed === "undefined" ? D[0][3] : z1Speed,
+					typeof z1Brightness === "undefined" ? D[0][4] : z1Brightness,
+				],
+				[
+					typeof z2Effect === "undefined" ? D[1][0] : z2Effect,
+					typeof z2Color1 === "undefined" ? D[1][1] : z2Color1,
+					typeof z2Color2 === "undefined" ? D[1][2] : z2Color2,
+					typeof z2Speed === "undefined" ? D[1][3] : z2Speed,
+					typeof z2Brightness === "undefined" ? D[1][4] : z2Brightness,
+				],
+				[
+					typeof z3Effect === "undefined" ? D[2][0] : z3Effect,
+					typeof z3Color1 === "undefined" ? D[2][1] : z3Color1,
+					typeof z3Color2 === "undefined" ? D[2][2] : z3Color2,
+					typeof z3Speed === "undefined" ? D[2][3] : z3Speed,
+					typeof z3Brightness === "undefined" ? D[2][4] : z3Brightness,
+				],
+				[
+					typeof z4Effect === "undefined" ? D[3][0] : z4Effect,
+					typeof z4Color1 === "undefined" ? D[3][1] : z4Color1,
+					typeof z4Color2 === "undefined" ? D[3][2] : z4Color2,
+					typeof z4Speed === "undefined" ? D[3][3] : z4Speed,
+					typeof z4Brightness === "undefined" ? D[3][4] : z4Brightness,
+				],
+			],
+		};
+	}
+
+	function truthy(value) {
+		return value === true || value === 1 || value === "1" || value === "true";
+	}
+
+	function toNumber(value, fallback, min, max) {
+		const n = Number(value);
+
+		return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+	}
+
+	const colorCache = new Map();
+
+	function hexToRgb(hex) {
+		let rgb = colorCache.get(hex);
+
+		if (!rgb) {
+			const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(String(hex).trim());
+			rgb = m ? [parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16)] : [0, 0, 0];
+			colorCache.set(hex, rgb);
+		}
+
+		return rgb;
+	}
+
+	function fract(x) {
+		return x - Math.floor(x);
+	}
+
+	function mix(a, b, k, out) {
+		out[0] = a[0] + (b[0] - a[0]) * k;
+		out[1] = a[1] + (b[1] - a[1]) * k;
+		out[2] = a[2] + (b[2] - a[2]) * k;
+
+		return out;
+	}
+
+	function hsv(h, out) {
+		const i = Math.floor(h * 6);
+		const f = h * 6 - i;
+		const q = 255 * (1 - f);
+		const t = 255 * f;
+
+		switch (((i % 6) + 6) % 6) {
+			case 0: out[0] = 255; out[1] = t; out[2] = 0; break;
+			case 1: out[0] = q; out[1] = 255; out[2] = 0; break;
+			case 2: out[0] = 0; out[1] = 255; out[2] = t; break;
+			case 3: out[0] = 0; out[1] = q; out[2] = 255; break;
+			case 4: out[0] = t; out[1] = 0; out[2] = 255; break;
+			default: out[0] = 255; out[1] = 0; out[2] = q; break;
+		}
+
+		return out;
+	}
+
+	/** Small integer hash -> [0, 1), stable per sparkle cell. */
+	function hash01(x, y, z) {
+		let h = (x * 374761393 + y * 668265263 + z * 2147483647) | 0;
+		h = Math.imul(h ^ (h >>> 13), 1274126177);
+		h ^= h >>> 16;
+
+		return (h >>> 0) / 4294967296;
+	}
+
+	/** Per-frame state of one zone: geometry plus everything that does not depend on the pixel. */
+	function prepareZone(index, rect, settings, t) {
+		const [effectName, color1, color2, speed, brightness] = settings;
+		const x0 = rect[0] * WIDTH;
+		const y0 = rect[1] * HEIGHT;
+		const w = (rect[2] - rect[0]) * WIDTH;
+		const h = (rect[3] - rect[1]) * HEIGHT;
+		const s = toNumber(speed, 0, -10, 10);
+		const zone = {
+			index, x0, y0, w, h,
+			cx: x0 + w / 2,
+			cy: y0 + h / 2,
+			horizontal: w >= h,
+			effect: Math.max(0, EFFECTS.indexOf(effectName)),
+			c1: hexToRgb(color1),
+			c2: hexToRgb(color2),
+			speed: s,
+			gain: toNumber(brightness, 100, 0, 100) / 100,
+			t,
+			fixed: null,
+		};
+
+		// Effects that color the whole zone the same way are computed once per frame.
+		if (zone.effect === 2) {
+			zone.fixed = hsv(fract(t * s * 0.05), [0, 0, 0]);
+		} else if (zone.effect === 3) {
+			const k = 0.5 - 0.5 * Math.cos(TAU * t * (0.1 + Math.abs(s) * 0.08));
+			zone.fixed = mix(zone.c2, zone.c1, s === 0 ? 1 : k, [0, 0, 0]);
+		} else if (zone.effect === 4) {
+			zone.fixed = zone.c1;
+		} else if (zone.effect === 9) {
+			zone.fixed = [0, 0, 0];
+		}
+
+		return zone;
+	}
+
+	/** Color of one point (x, y in canvas pixels) of a zone, written to `out`. */
+	function shade(z, x, y, out) {
+		if (z.fixed) {
+			out[0] = z.fixed[0]; out[1] = z.fixed[1]; out[2] = z.fixed[2];
+
+			return out;
+		}
+
+		const along = z.horizontal ? (x - z.x0) / z.w : (y - z.y0) / z.h;   // 0..1 along the zone's long side
+		const t = z.t;
+		const s = z.speed;
+
+		switch (z.effect) {
+			case 0: // Regenbogen-Welle
+				return hsv(fract(along - t * s * 0.1), out);
+			case 1: // Regenbogen-Rad: hue follows the angle around the zone center, ideal for fans and pumps
+				return hsv(fract(Math.atan2(y - z.cy, x - z.cx) / TAU + t * s * 0.1), out);
+			case 5: { // Verlauf: color 1 -> color 2 -> color 1, moving
+				const p = fract(along - t * s * 0.05);
+
+				return mix(z.c1, z.c2, 1 - Math.abs(2 * p - 1), out);
+			}
+			case 6: { // Lauflicht: a bright head in color 1 with a fading tail on color 2
+				const head = fract(t * s * 0.08);
+				const behind = s >= 0 ? fract(head - along) : fract(along - head);
+				const k = behind < 0.35 ? (1 - behind / 0.35) * (1 - behind / 0.35) : 0;
+
+				return mix(z.c2, z.c1, k, out);
+			}
+			case 7: { // Drehen: two colors rotating around the zone center
+				const a = Math.atan2(y - z.cy, x - z.cx) / TAU - t * s * 0.1;
+
+				return mix(z.c2, z.c1, 0.5 + 0.5 * Math.cos(TAU * a), out);
+			}
+			case 8: { // Funkeln: sparkles in color 1 on color 2
+				const cx = Math.floor((x - z.x0) / 8);
+				const cy = Math.floor((y - z.y0) / 8);
+				const phase = fract(t * (0.3 + Math.abs(s) * 0.15) + hash01(cx, cy, z.index));
+				const k = phase < 0.2 ? Math.sin(Math.PI * phase / 0.2) : 0;
+
+				return mix(z.c2, z.c1, k, out);
+			}
+			default:
+				out[0] = 0; out[1] = 0; out[2] = 0;
+
+				return out;
+		}
+	}
+
+	let zoneMap = new Int8Array(COLS * ROWS);
+	let mappedLayout = "";
+	let rects = [];
+
+	/** Which zone every 2x2 block belongs to; rebuilt only when the layout changes. */
+	function mapZones(layout) {
+		if (layout === mappedLayout) {
+			return;
+		}
+
+		rects = LAYOUTS[layout] || LAYOUTS[DEFAULTS.layout];
+		mappedLayout = layout;
+		zoneMap = new Int8Array(COLS * ROWS);
+
+		for (let by = 0; by < ROWS; by++) {
+			for (let bx = 0; bx < COLS; bx++) {
+				const u = (bx * BLOCK + BLOCK / 2) / WIDTH;
+				const v = (by * BLOCK + BLOCK / 2) / HEIGHT;
+				let zone = 0;
+
+				for (let i = 0; i < rects.length; i++) {
+					const r = rects[i];
+
+					if (u >= r[0] && u < r[2] && v >= r[1] && v < r[3]) {
+						zone = i;
+						break;
+					}
+				}
+
+				zoneMap[by * COLS + bx] = zone;
+			}
+		}
+	}
+
+	const image = ctx.createImageData(WIDTH, HEIGHT);
+	const words = new Uint32Array(image.data.buffer);   // one write per pixel (RGBA, little endian)
+	const pixel = [0, 0, 0];
+
+	function render(now) {
+		const props = readProperties();
+		const t = now / 1000;
+
+		mapZones(props.layout);
+
+		const zones = rects.map((rect, i) => prepareZone(i, rect, props.zones[i], t));
+
+		for (let by = 0; by < ROWS; by++) {
+			for (let bx = 0; bx < COLS; bx++) {
+				const z = zones[zoneMap[by * COLS + bx]];
+				const x = bx * BLOCK + BLOCK / 2;
+				const y = by * BLOCK + BLOCK / 2;
+				shade(z, x, y, pixel);
+
+				const r = (pixel[0] * z.gain + 0.5) | 0;
+				const g = (pixel[1] * z.gain + 0.5) | 0;
+				const b = (pixel[2] * z.gain + 0.5) | 0;
+				const word = (0xFF000000 | (b << 16) | (g << 8) | r) >>> 0;
+
+				for (let dy = 0; dy < BLOCK && by * BLOCK + dy < HEIGHT; dy++) {
+					let o = (by * BLOCK + dy) * WIDTH + bx * BLOCK;
+
+					for (let dx = 0; dx < BLOCK && bx * BLOCK + dx < WIDTH; dx++) {
+						words[o++] = word;
+					}
+				}
+			}
+		}
+
+		ctx.putImageData(image, 0, 0);
+
+		if (truthy(props.showZones)) {
+			drawZoneGuides(zones);
+		}
+	}
+
+	function drawZoneGuides(zones) {
+		ctx.save();
+		ctx.lineWidth = 2;
+		ctx.textAlign = "center";
+		ctx.textBaseline = "middle";
+		ctx.font = "bold 48px sans-serif";
+
+		for (const z of zones) {
+			ctx.strokeStyle = "#ffffff";
+			ctx.strokeRect(z.x0 + 1, z.y0 + 1, z.w - 2, z.h - 2);
+			ctx.lineWidth = 6;
+			ctx.strokeStyle = "#000000";
+			ctx.strokeText(String(z.index + 1), z.cx, z.cy);
+			ctx.fillStyle = "#ffffff";
+			ctx.fillText(String(z.index + 1), z.cx, z.cy);
+			ctx.lineWidth = 2;
+		}
+
+		ctx.restore();
+	}
+
+	function update() {
+		render(Date.now());
+		window.requestAnimationFrame(update);
+	}
+
+	window.requestAnimationFrame(update);
+</script>
