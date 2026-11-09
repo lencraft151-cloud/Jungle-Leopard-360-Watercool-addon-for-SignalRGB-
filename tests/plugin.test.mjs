@@ -1,4 +1,4 @@
-// End-to-end lifecycle tests: SignalRGB host (mocked) -> plugin -> USB byte stream -> fake panel firmware.
+// End-to-end lifecycle tests: SignalRGB host (mocked) -> plugin -> COM port byte stream -> fake panel firmware.
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -6,7 +6,7 @@ import fs from "node:fs";
 import LCD from "@SignalRGB/lcd";
 import * as Plugin from "../Jungle_Leopard_LCD.js";
 import { FakePanel, isPanelReady } from "./helpers/fake-panel.mjs";
-import { cdcConfigDescriptor, installClock, installDevice, setProperties } from "./helpers/device-mock.mjs";
+import { installClock, installDevice, setProperties } from "./helpers/device-mock.mjs";
 import { makeBmp24, makeTestPattern } from "./helpers/images.mjs";
 
 const I = Plugin._internals;
@@ -27,8 +27,11 @@ function bmpFor(width, height) {
 	return bmpCache.get(key);
 }
 
-/** Behaves like SignalRGB rendering a face: JPEG or BMP of the viewport requested via LCD.initialize. */
-function faceProvider({ jpeg = NATIVE, bmp = true } = {}) {
+/**
+ * Behaves like SignalRGB rendering a face: JPEG, BMP or RGB of the viewport requested via LCD.initialize.
+ * RGB is off by default, as in SignalRGB builds that only offer BMP.
+ */
+function faceProvider({ jpeg = NATIVE, bmp = true, rgb = false } = {}) {
 	return (options) => {
 		if (options.format === "JPEG") {
 			return typeof jpeg === "function" ? jpeg() : jpeg;
@@ -36,11 +39,15 @@ function faceProvider({ jpeg = NATIVE, bmp = true } = {}) {
 
 		const viewport = LCD.initializeCalls.at(-1);
 
+		if (options.format === "RGB") {
+			return rgb ? Array.from(makeTestPattern(viewport.width, viewport.height)) : [];
+		}
+
 		return bmp ? bmpFor(viewport.width, viewport.height) : [];
 	};
 }
 
-function boot({ panel: panelOptions, props = {}, face = faceProvider() } = {}) {
+function boot({ panel: panelOptions, props = {}, face = faceProvider(), serial = {} } = {}) {
 	LCD.reset();
 	LCD.frameProvider = face;
 
@@ -48,7 +55,7 @@ function boot({ panel: panelOptions, props = {}, face = faceProvider() } = {}) {
 	const panel = new FakePanel(panelOptions);
 	panel.clock = clock;
 
-	const dev = installDevice(panel, clock);
+	const dev = installDevice(panel, clock, serial);
 	setProperties({ ...DEFAULT_PROPS, ...props });
 	Plugin.Initialize();
 
@@ -87,7 +94,7 @@ function assertCleanStream(panel) {
 
 test("exports satisfy SignalRGB's plugin validator rules", () => {
 	assert.equal(Plugin.DeviceType(), "lcd");
-	assert.equal(Plugin.Type(), "rawusb");
+	assert.equal(Plugin.Type(), "serial");
 	assert.equal(Plugin.VendorId(), 0x33C3);
 	assert.equal(Plugin.ProductId(), 0x7788);
 	assert.equal(Plugin.ImageUrl, undefined, "exactly one image export");
@@ -112,20 +119,17 @@ test("exports satisfy SignalRGB's plugin validator rules", () => {
 		}
 	}
 
-	assert.equal(Plugin.Validate({ interface: 1 }), true, "CDC data interface (bulk endpoints)");
-	assert.equal(Plugin.Validate({ interface: -1 }), true, "device without interface number");
-	assert.equal(Plugin.Validate({ interface: 0 }), false, "must not become the active endpoint");
-	assert.equal(Plugin.Validate({ interface: 2 }), false);
+	assert.equal(Plugin.Validate({ interface: 0 }), true, "the panel's COM port");
+	assert.equal(Plugin.Validate({ interface: -1 }), true);
+	assert.equal(Plugin.ControllableParameters()[0].property, "displayEnabled", "the on/off switch comes first");
 });
 
-test("Initialize opens the CDC line, identifies the panel and requests a 960x480 face viewport", () => {
+test("Initialize opens the COM port at 115200 8N1, identifies the panel and requests a 960x480 face viewport", () => {
 	const { panel, dev } = boot();
 
-	assert.deepEqual(dev.controlTransfers.map(({ type, request, value, index, data, length }) => ({ type, request, value, index, data, length })), [
-		{ type: 0x80, request: 0x06, value: 0x0200, index: 0, data: [], length: 255 },
-		{ type: 0x21, request: 0x20, value: 0, index: 0, data: [0x00, 0xC2, 0x01, 0x00, 0x00, 0x00, 0x08], length: 7 },
-		{ type: 0x21, request: 0x22, value: 3, index: 0, data: [], length: 0 },
-	]);
+	assert.deepEqual(dev.port.connectCalls, [{ baudRate: 115200, dataBits: 8, stopBits: "One", parity: "None" }],
+		"the options SignalRGB's own serial plugins use, no port name (SignalRGB binds the device's port)");
+	assert.equal(dev.port.connected, true);
 
 	const sequence = panel.events.map((e) => (e.type === "control" ? `cmd${e.command.toString(16)}` : e.type));
 	assert.deepEqual(sequence, ["resync", "zeros", "cmd6", "cmd3", "cmd11"]);
@@ -133,6 +137,7 @@ test("Initialize opens the CDC line, identifies the panel and requests a 960x480
 	assert.deepEqual(LCD.initializeCalls, [{ width: 960, height: 480 }]);
 	assert.equal(I.getState().panelInfo.model, "TXW818-ST7701S-5.5inch-hor");
 	assert.equal(I.getState().panelInfo.version, 3.1);
+	assert.deepEqual(activeTitles(dev), []);
 	assertCleanStream(panel);
 });
 
@@ -300,18 +305,17 @@ test("a different display behind the generic 33C3:7788 ID is left alone", () => 
 	assert.deepEqual(LCD.initializeCalls, []);
 	assert.equal(ctx.panel.images().length, 0);
 	assert.equal(ctx.panel.controls(0x11).length, 0);
+	assert.equal(ctx.dev.port.connected, false, "the COM port is released again");
 });
 
-test("a panel that does not answer the info request still works, but the user is told why it may not", () => {
+test("a panel that does not answer the info request still gets the face, without a false alarm", () => {
 	const ctx = boot({ panel: { answerInfo: false } });
 	run(ctx, 200);
 
 	assert.equal(I.getState().panelInfo, null);
 	assert.ok(ctx.panel.images().length >= 1);
-
-	const alert = ctx.dev.activeAlerts().find((a) => a.title === "Display antwortet nicht");
-	assert.ok(alert, "no-reply warning");
-	assert.ok(alert.description.includes("Hersteller-App"));
+	assert.deepEqual(activeTitles(ctx.dev), []);
+	assert.ok(diagnosis(ctx.dev).description.includes("Reply: none (no reply (0 B))"), diagnosis(ctx.dev).description);
 	assertCleanStream(ctx.panel);
 });
 
@@ -322,21 +326,18 @@ test("startup diagnosis: shown as a notification and written to the log file", (
 	assert.ok(report, "diagnosis notification");
 	assert.equal(report.title, "Jungle Leopard LCD - Diagnose");
 	assert.equal(report.priority, 0);
-	assert.match(report.description, /^Plugin \d+\.\d+\.\d+ \| Validate: /);
+	assert.match(report.description, /^Plugin 2\.\d+\.\d+ \| Serial: yes \| /);
 
 	for (const part of [
-		"USB: if0 cls 0x02 [0x83 int]; if1 cls 0x0a [0x02 bulk, 0x81 bulk]",
-		"Endpoints: OUT 0x02 IN 0x81, control if0",
-		"Line: line coding: array(0); DTR/RTS: array(0)",
-		"Write: array(0)",
+		"Port: COM5 (33C3:7788, USB Serial Device)",
+		"Connect: open (undefined)",
+		"Write: number 4",
 		"TXW818-ST7701S-5.5inch-hor, FW 3.1",
 	]) {
 		assert.ok(report.description.includes(part), `missing "${part}" in: ${report.description}`);
 	}
 
-	const lines = ctx.dev.logs.join("\n");
-	assert.match(lines, /USB device: \{"vid":13251,"pid":30600/);
-	assert.ok(lines.includes(`Diagnosis: ${report.description}`));
+	assert.ok(ctx.dev.logs.some((l) => l.includes(`Diagnosis: ${report.description}`)));
 });
 
 test("the startup diagnosis can be switched off", () => {
@@ -346,126 +347,165 @@ test("the startup diagnosis can be switched off", () => {
 	assert.ok(ctx.dev.logs.some((l) => l.includes("Diagnosis: Plugin")), "still logged");
 });
 
-test("endpoints are taken from the device's own USB descriptor", () => {
-	LCD.reset();
-	LCD.frameProvider = faceProvider();
+test("Display On switch: off means backlight 0 and black frames while live mode continues; on restores the face", () => {
+	const ctx = boot({ props: { lcdBrightness: "70" } });
+	run(ctx, 300);
 
-	const clock = installClock();
-	const panel = new FakePanel();
-	panel.clock = clock;
+	setProperties({ displayEnabled: false });
+	Plugin.ondisplayEnabledChanged();
 
-	const descriptor = cdcConfigDescriptor({ commInterface: 2, dataInterface: 3, epInt: 0x84, epOut: 0x01, epIn: 0x82 });
-	const dev = installDevice(panel, clock, { epOut: 0x01, epIn: 0x82, descriptor });
-	setProperties(DEFAULT_PROPS);
-	Plugin.Initialize();
+	assert.deepEqual(ctx.panel.controls(0x03).at(-1).payload, [0], "backlight off at once");
 
-	for (let t = 0; t < 300; t += 33) {
-		Plugin.Render();
-		clock.advance(33);
+	const before = ctx.panel.images().length;
+	const livesBefore = ctx.panel.controls(0x11).length;
+	const requestsBefore = LCD.frameRequests.length;
+	run(ctx, 3000);
+
+	const dark = ctx.panel.images().slice(before);
+	assert.ok(dark.length >= 2 && dark.length <= 4, `${dark.length} black frames in 3 s`);
+	assert.ok(dark.every((image) => image.ready && image.jpeg.length < 20000), "small black frames");
+	assert.ok(ctx.panel.controls(0x11).length - livesBefore >= 2, "keep-alive continues, so the panel's animation stays away");
+	assert.equal(LCD.frameRequests.length, requestsBefore, "no face rendering while off");
+
+	setProperties({ displayEnabled: true });
+	run(ctx, 300);
+
+	assert.deepEqual(ctx.panel.controls(0x03).at(-1).payload, [70], "brightness restored");
+	assert.deepEqual(ctx.panel.images().at(-1).jpeg, NATIVE, "the face is back");
+	assertCleanStream(ctx.panel);
+});
+
+test("Display On off at start: the panel starts dark", () => {
+	const ctx = boot({ props: { displayEnabled: "false" } });
+	run(ctx, 1500);
+
+	assert.deepEqual(ctx.panel.controls(0x03).map((e) => e.payload[0]), [0]);
+	assert.ok(ctx.panel.images().length >= 1);
+	assert.ok(ctx.panel.images().every((image) => image.jpeg.length < 20000));
+});
+
+test("COM port held by another program: a clear alert naming the port, quiet retries, recovery once it is free", () => {
+	const ctx = boot({ serial: { busy: true } });
+	run(ctx, 7000);
+
+	const alert = problemAlerts(ctx.dev).find((a) => a.title === "COM-Port des Displays belegt");
+	assert.ok(alert, `alerts: ${activeTitles(ctx.dev)}`);
+	assert.ok(alert.description.includes("COM5"));
+	assert.ok(alert.description.includes("Hersteller-App"));
+	assert.ok(diagnosis(ctx.dev).description.includes("Error: COM5 could not be opened"), diagnosis(ctx.dev).description);
+	assert.ok(ctx.dev.port.connectCalls.length >= 3, "retried");
+	assert.equal(ctx.dev.logs.filter((l) => l.includes("Reconnect failed")).length, 1, "retries are not logged every time");
+	assert.equal(ctx.panel.events.length, 0);
+
+	ctx.dev.port.busy = false;
+	run(ctx, 2500);
+
+	assert.deepEqual(activeTitles(ctx.dev), []);
+	assert.ok(ctx.panel.images().length >= 1);
+	assertCleanStream(ctx.panel);
+});
+
+test("connect() throwing (e.g. access denied) is reported as a busy port, too", () => {
+	const ctx = boot({ serial: { connectThrows: true } });
+
+	assert.deepEqual(activeTitles(ctx.dev), ["COM-Port des Displays belegt"]);
+	assert.ok(diagnosis(ctx.dev).description.includes("Connect: failed (Access is denied.)"));
+});
+
+test("a SignalRGB build without the serial module asks for an update instead of failing silently", () => {
+	const ctx = boot({ serial: { missing: ["connect", "write", "isConnected"] } });
+	run(ctx, 3000);
+
+	assert.deepEqual(activeTitles(ctx.dev), ["SignalRGB-Update nötig"]);
+	assert.ok(diagnosis(ctx.dev).description.includes("Serial: missing"));
+});
+
+test("write failures raise an alert, the port is reopened and the stream resumes cleanly", () => {
+	const ctx = boot();
+	run(ctx, 200);
+	ctx.dev.port.failWrites = true;
+	run(ctx, 500);
+
+	assert.deepEqual(activeTitles(ctx.dev), ["Verbindung zum Display unterbrochen"]);
+	assert.ok(problemAlerts(ctx.dev)[0].description.includes("write failed (number -1)"));
+
+	const connects = ctx.dev.port.connectCalls.length;
+	ctx.dev.port.failWrites = false;
+	const sent = ctx.panel.images().length;
+	run(ctx, 2500);
+
+	assert.deepEqual(activeTitles(ctx.dev), []);
+	assert.ok(ctx.dev.port.connectCalls.length > connects, "the port was opened again");
+	assert.ok(ctx.panel.images().length > sent);
+	assertCleanStream(ctx.panel);
+});
+
+test("unplugging and replugging the display: alert while it is gone, then it comes back on its own", () => {
+	const ctx = boot();
+	run(ctx, 200);
+	ctx.dev.port.unplug();
+	run(ctx, 3000);
+
+	assert.ok(activeTitles(ctx.dev).length === 1, `alerts: ${activeTitles(ctx.dev)}`);
+
+	ctx.dev.port.busy = false;
+	const sent = ctx.panel.images().length;
+	run(ctx, 2500);
+
+	assert.deepEqual(activeTitles(ctx.dev), []);
+	assert.ok(ctx.panel.images().length > sent);
+	assertCleanStream(ctx.panel);
+});
+
+test("partial writes are completed, so frames still arrive intact", () => {
+	const ctx = boot({ serial: { shortWrites: true } });
+	run(ctx, 300);
+
+	assert.ok(ctx.panel.images().length >= 1);
+	assert.deepEqual(ctx.panel.images()[0].jpeg, NATIVE);
+	assertCleanStream(ctx.panel);
+});
+
+test("write() results other than a byte count (undefined, true, 0 while open) are not treated as errors", () => {
+	for (const writeResult of [undefined, true, 0]) {
+		const ctx = boot({ serial: { writeResult } });
+		run(ctx, 300);
+
+		assert.deepEqual(activeTitles(ctx.dev), [], `writeResult ${writeResult}`);
+		assert.ok(ctx.panel.images().length >= 1);
+		assertCleanStream(ctx.panel);
 	}
-
-	assert.ok(panel.images().length >= 1, "frames reach the panel on the discovered endpoint");
-	assert.ok(I.getState().panelInfo, "the info reply is read from the discovered IN endpoint");
-	assert.ok(dev.controlTransfers.filter((c) => c.type === 0x21).every((c) => c.index === 2), "line setup on the CDC communication interface");
-	assert.ok(diagnosis(dev).description.includes("Endpoints: OUT 0x01 IN 0x82, control if2"));
-	assert.deepEqual(activeTitles(dev), []);
-	assertCleanStream(panel);
 });
 
-function bootWith(deviceOptions, props = {}) {
-	LCD.reset();
-	LCD.frameProvider = faceProvider();
+test("without read support the panel is not identified, but frames are still sent", () => {
+	const ctx = boot({ serial: { missing: ["read", "readAll"] } });
+	run(ctx, 300);
 
-	const clock = installClock();
-	const panel = new FakePanel();
-	panel.clock = clock;
-
-	const dev = installDevice(panel, clock, deviceOptions);
-	setProperties({ ...DEFAULT_PROPS, ...props });
-	Plugin.Initialize();
-
-	for (let t = 0; t < 300; t += 33) {
-		Plugin.Render();
-		clock.advance(33);
-	}
-
-	return { clock, panel, dev };
-}
-
-test("the data interface is made the active endpoint when SignalRGB lists it", () => {
-	const hidEndpoints = [
-		{ interface: 0, usage: 0, usage_page: 0, collection: 0 },
-		{ interface: 1, usage: 0, usage_page: 0, collection: 0 },
-	];
-	const { dev } = bootWith({ hidEndpoints });
-
-	assert.deepEqual(dev.setEndpointCalls, [{ iface: 1, usage: 0, usagePage: 0, collection: 0 }]);
-	assert.ok(diagnosis(dev).description.includes("Active: set_endpoint if1 (listed: 0,1)"));
+	assert.equal(I.getState().panelInfo, null);
+	assert.ok(diagnosis(ctx.dev).description.includes("Reply: none (read not supported)"));
+	assert.ok(ctx.panel.images().length >= 1);
+	assert.deepEqual(activeTitles(ctx.dev), []);
 });
 
-test("when neither USB nor the bridge transport is available, the user gets the connection alert with both reasons", () => {
-	const { panel, dev } = bootWith({ bulkBroken: true });
-	const alert = problemAlerts(dev).find((a) => a.title === "Verbindung zum Display unterbrochen");
+test("the info reply is read in short slices, never blocking the render thread for long", () => {
+	const ctx = boot();
 
-	assert.ok(alert, `alerts: ${activeTitles(dev)}`);
-	assert.ok(alert.description.includes("USB write error -1; bridge: SignalRGB udp feature not available"), alert.description);
-	assert.equal(panel.images().length, 0);
+	assert.ok(ctx.dev.port.readCalls.length >= 1);
+	assert.ok(ctx.dev.port.readCalls.every((c) => c.maxBytes === 512 && c.timeout === 50));
 });
 
-test("an unreadable descriptor falls back to the CherryUSB defaults and says so", () => {
-	LCD.reset();
-	LCD.frameProvider = faceProvider();
+test("raw RGB frames are used where SignalRGB offers them (no BMP needed)", () => {
+	const ctx = boot({ face: faceProvider({ rgb: true, bmp: false }), props: { faceLayout: I.LAYOUT_SQUARE } });
+	run(ctx, 300);
 
-	const clock = installClock();
-	const panel = new FakePanel();
-	const dev = installDevice(panel, clock, { descriptor: null });
-	setProperties(DEFAULT_PROPS);
-	Plugin.Initialize();
-	Plugin.Render();
-
-	assert.ok(diagnosis(dev).description.includes("USB: unreadable (array(0))"));
-	assert.ok(diagnosis(dev).description.includes("Endpoints: OUT 0x02 IN 0x81"));
-	assert.ok(panel.images().length >= 1);
+	assert.ok(LCD.frameRequests.includes("RGB"));
+	assert.ok(!LCD.frameRequests.includes("BMP"));
+	assert.ok(ctx.panel.images().length >= 1);
+	assert.deepEqual(activeTitles(ctx.dev), []);
+	assertCleanStream(ctx.panel);
 });
 
-test("detected but blocked by the Windows serial driver: a clear alert instead of a silent blank display", () => {
-	LCD.reset();
-	LCD.frameProvider = faceProvider();
-
-	const clock = installClock();
-	const panel = new FakePanel();
-	const dev = installDevice(panel, clock, { writeErrorCode: -12 });
-	setProperties(DEFAULT_PROPS);
-	Plugin.Initialize();
-
-	for (let t = 0; t < 7000; t += 33) {
-		Plugin.Render();
-		clock.advance(33);
-	}
-
-	const alert = dev.activeAlerts().find((a) => a.title === "Verbindung zum Display unterbrochen");
-	assert.ok(alert, `alerts: ${dev.activeAlerts().map((a) => a.title)}`);
-	assert.ok(alert.description.includes("USB write error -12"));
-	assert.ok(alert.description.includes("Jungle Leopard LCD Bridge"));
-	assert.ok(dev.logs.some((l) => l.includes("Write: number -12")));
-	assert.ok(diagnosis(dev).description.includes("Error: USB write error -12; bridge: SignalRGB udp feature not available"));
-	assert.equal(dev.logs.filter((l) => l.includes("Reconnect failed")).length, 1, "retries are not logged every time");
-	assert.equal(panel.events.length, 0);
-
-	// Once the driver is fixed, the plugin recovers by itself.
-	dev.writeErrorCode = 0;
-
-	for (let t = 0; t < 3000; t += 33) {
-		Plugin.Render();
-		clock.advance(33);
-	}
-
-	assert.ok(!dev.activeAlerts().some((a) => a.title === "Verbindung zum Display unterbrochen"));
-	assert.ok(panel.images().length >= 1);
-	assertCleanStream(panel);
-});
-
-test("shutdown releases the panel; Close (0x21) only on firmware 3.1+, backlight off on request", () => {
+test("shutdown releases the panel and frees the COM port; Close (0x21) only on firmware 3.1+", () => {
 	const ctx = boot();
 	run(ctx, 100);
 	Plugin.Shutdown(false);
@@ -473,10 +513,11 @@ test("shutdown releases the panel; Close (0x21) only on firmware 3.1+, backlight
 	const tail = ctx.panel.events.slice(-2).map((e) => (e.type === "control" ? e.command : e.type));
 	assert.deepEqual(tail, ["resync", 0x21]);
 	assert.ok(!ctx.panel.controls(0x03).some((e) => e.payload[0] === 0));
+	assert.equal(ctx.dev.port.connected, false, "port freed for the vendor app");
 
 	const dark = boot({ props: { shutdownBehavior: "Backlight Off" }, panel: { answerInfo: false } });
 	run(dark, 100);
-	Plugin.Shutdown(true);
+	Plugin.Shutdown(false);
 
 	assert.deepEqual(dark.panel.controls(0x03).at(-1).payload, [0]);
 	assert.equal(dark.panel.controls(0x21).length, 0, "firmware unknown: no Close");
@@ -486,21 +527,13 @@ test("shutdown releases the panel; Close (0x21) only on firmware 3.1+, backlight
 	assert.equal(dark.panel.events.length, before, "nothing is sent after shutdown");
 });
 
-test("USB failures raise an alert, then the plugin reconnects on its own", () => {
+test("system suspend always switches the backlight off", () => {
 	const ctx = boot();
-	run(ctx, 200);
-	ctx.dev.failWrites = true;
-	run(ctx, 500);
+	run(ctx, 100);
+	Plugin.Shutdown(true);
 
-	assert.deepEqual(activeTitles(ctx.dev), ["Verbindung zum Display unterbrochen"]);
-
-	ctx.dev.failWrites = false;
-	const sent = ctx.panel.images().length;
-	run(ctx, 2500);
-
-	assert.deepEqual(activeTitles(ctx.dev), []);
-	assert.ok(ctx.panel.images().length > sent);
-	assertCleanStream(ctx.panel);
+	assert.deepEqual(ctx.panel.controls(0x03).at(-1).payload, [0]);
+	assert.equal(ctx.dev.port.connected, false);
 });
 
 test("frames whose length collides with the 55 AA magic are still received as images", () => {
@@ -518,4 +551,32 @@ test("frames whose length collides with the 55 AA magic are still received as im
 	assert.equal(ctx.panel.images()[0].jpeg.length, 0xAA55 + 5);
 	assert.deepEqual(ctx.panel.controls().map((e) => e.command).filter((c) => ![0x03, 0x06, 0x11].includes(c)), []);
 	assertCleanStream(ctx.panel);
+});
+
+test("port busy at start, free later: the panel is identified then and the diagnosis shows the working state", () => {
+	const ctx = boot({ serial: { busy: true } });
+	run(ctx, 1000);
+
+	assert.ok(diagnosis(ctx.dev).description.includes("Error:"));
+	assert.equal(I.getState().panelInfo, null);
+
+	ctx.dev.port.busy = false;
+	run(ctx, 2500);
+
+	assert.equal(I.getState().panelInfo.model, "TXW818-ST7701S-5.5inch-hor");
+	assert.ok(!diagnosis(ctx.dev).description.includes("Error:"), diagnosis(ctx.dev).description);
+	assert.ok(diagnosis(ctx.dev).description.includes("Connect: open"));
+	assert.deepEqual(activeTitles(ctx.dev), []);
+	assertCleanStream(ctx.panel);
+});
+
+test("a foreign display found only on reconnect is left alone, too", () => {
+	const ctx = boot({ serial: { busy: true }, panel: { infoReply: { model: "HT-8.8inch", width: 462, height: 1920 } } });
+	run(ctx, 500);
+	ctx.dev.port.busy = false;
+	run(ctx, 2500);
+
+	assert.deepEqual(activeTitles(ctx.dev), ["Nicht unterstütztes Display"], "the busy-port alert is gone");
+	assert.equal(ctx.panel.images().length, 0);
+	assert.equal(ctx.dev.port.connected, false);
 });

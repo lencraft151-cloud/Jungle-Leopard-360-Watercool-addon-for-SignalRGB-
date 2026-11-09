@@ -7,9 +7,10 @@
  * the user picks from the SignalRGB library (and remembers that choice). This
  * plugin only carries the rendered frames to the panel.
  *
- * Transport: the panel enumerates as a CherryUSB CDC-ACM device (33C3:7788).
- * SignalRGB plugins have no serial API, so the frames are written with raw USB
- * bulk transfers to the CDC data interface (interface 1, bulk OUT 0x02).
+ * Transport: the panel enumerates as a CherryUSB CDC-ACM device (33C3:7788), i.e.
+ * a COM port ("USB Serial Device"). The plugin uses SignalRGB's official serial
+ * module (@SignalRGB/serial, Type "serial"), exactly like SignalRGB's own Turzx
+ * LCD and HYTE CNVS plugins. No extra driver and no helper program are needed.
  *
  * Panel protocol (recovered from the vendor app by the open-source projects
  * senesees/Jungle-Leopard-Display-TZMRIT-PF360-LCD and yughias/JL-LCD-AIO):
@@ -19,8 +20,10 @@
  *   images        : 960 x 480, baseline JPEG, 4:2:0 chroma subsampling, <= 80 KB
  */
 import LCD from "@SignalRGB/lcd";
+import serial from "@SignalRGB/serial";
 
 /* global
+displayEnabled:readonly
 faceLayout:readonly
 mountOrientation:readonly
 sideFillColor:readonly
@@ -32,7 +35,7 @@ shutdownBehavior:readonly
 startupReport:readonly
 */
 
-const PLUGIN_VERSION = "1.1.0";
+const PLUGIN_VERSION = "2.0.0";
 
 export function Name() { return "Jungle Leopard LCD"; }
 export function VendorId() { return 0x33C3; }
@@ -42,7 +45,7 @@ export function Size() { return [1, 1]; }
 export function DefaultPosition() { return [240, 120]; }
 export function DefaultScale() { return 1.0; }
 export function DeviceType() { return "lcd"; }
-export function Type() { return "rawusb"; }
+export function Type() { return "serial"; }
 export function LedNames() { return []; }
 export function LedPositions() { return []; }
 
@@ -64,6 +67,12 @@ const SHUTDOWN_BACKLIGHT_OFF = "Backlight Off";
 
 export function ControllableParameters() {
 	return [
+		{
+			property: "displayEnabled", group: "", label: "Display On", type: "boolean",
+			description: "Switches the pump display on or off. Off sets the backlight to 0 and shows black, " +
+				"so the panel's own animation does not come back while SignalRGB is running.",
+			default: "true",
+		},
 		{
 			property: "faceLayout", group: "", label: "Face Layout", type: "combobox",
 			description: "Full Panel renders the selected SignalRGB LCD face directly at 960x480. " +
@@ -109,27 +118,16 @@ export function ControllableParameters() {
 		},
 		{
 			property: "startupReport", group: "", label: "Startup Diagnostics", type: "boolean",
-			description: "Shows a SignalRGB notification after start with the USB diagnosis (endpoints, transfer results, " +
-				"panel answer). Useful when the display stays dark.",
+			description: "Shows a SignalRGB notification after start with the connection diagnosis (COM port, write " +
+				"result, panel answer). Useful when the display does not show the face.",
 			default: "true",
 		},
 	];
 }
 
-/** Endpoints SignalRGB offered in Validate(); reported in the startup diagnosis. */
-const offeredEndpoints = [];
-
-/**
- * Open only the CDC data interface (1): it carries the bulk endpoints. SignalRGB uses one opened endpoint
- * at a time, and accepting interface 0 as well made the endpoint-less communication interface the active
- * one, so every bulk transfer failed with -1 (seen on real hardware). -1 = device without interface number.
- */
-export function Validate(endpoint) {
-	if (offeredEndpoints.length < 16) {
-		offeredEndpoints.push(endpoint && endpoint.interface);
-	}
-
-	return endpoint.interface === -1 || endpoint.interface === 1;
+/** One COM port per panel: whatever endpoint SignalRGB offers for 33C3:7788 is the panel. */
+export function Validate() {
+	return true;
 }
 
 export function Image() {
@@ -149,20 +147,19 @@ const KEEPALIVE_INTERVAL_MS = 1000;     // live mode lapses after ~1500 ms
 const STILL_REFRESH_MS = 250;           // the panel only commits a frame once more bytes follow
 const NO_FRAME_GRACE_MS = 1500;
 const RECOVERY_INTERVAL_MS = 2000;
-const INFO_TIMEOUT_MS = 600;
+const INFO_TIMEOUT_MS = 800;
+const DISPLAY_OFF_REFRESH_MS = 1000;   // black frame repeat while the display is switched off
 const OVERSIZE_STREAK_LIMIT = 5;
 const RAW_REPROBE_MS = 10000;
 const MIN_REENCODE_QUALITY = 25;
 const STATUS_QUALITY = 80;
 
-const USB = {
-	COMM_INTERFACE: 0,
-	DATA_INTERFACE: 1,
-	EP_OUT: 0x02,
-	EP_IN: 0x81,
-	CHUNK_BYTES: 4096,
+const SERIAL = {
+	BAUD_RATE: 115200,
+	CHUNK_BYTES: 16384,
 	READ_BYTES: 512,
-	READ_ATTEMPTS: 40,
+	READ_SLICE_MS: 50,
+	MAX_WRITE_ATTEMPTS: 64,
 };
 
 const CMD = {
@@ -350,223 +347,213 @@ function extractReply(buffer) {
 	return null;
 }
 
-/** Interfaces and endpoints from a USB configuration descriptor (class-specific descriptors are skipped). */
-function parseConfigDescriptor(bytes) {
-	const interfaces = [];
-	let current = null;
-
-	for (let i = 0; i + 1 < bytes.length;) {
-		const length = bytes[i];
-		const type = bytes[i + 1];
-
-		if (length < 2 || i + length > bytes.length) {
-			break;
-		}
-
-		if (type === 0x04 && length >= 9) {
-			current = { number: bytes[i + 2], alternate: bytes[i + 3], cls: bytes[i + 5], endpoints: [] };
-			interfaces.push(current);
-		} else if (type === 0x05 && length >= 7 && current) {
-			current.endpoints.push({ address: bytes[i + 2], transfer: bytes[i + 3] & 0x03 });
-		}
-
-		i += length;
-	}
-
-	return interfaces;
-}
-
-const BULK = 0x02;
-
-/** Picks the interface with a bulk IN and bulk OUT pair, preferring the CDC data class (0x0A). */
-function pickEndpoints(interfaces) {
-	const hasBulk = (iface, dirIn) => iface.endpoints.find((e) => e.transfer === BULK && Boolean(e.address & 0x80) === dirIn);
-	const candidates = interfaces.filter((iface) => iface.alternate === 0 && hasBulk(iface, true) && hasBulk(iface, false));
-	const data = candidates.find((iface) => iface.cls === 0x0A) || candidates[0];
-
-	if (!data) {
-		return null;
-	}
-
-	const comm = interfaces.find((iface) => iface.cls === 0x02);
-
-	return {
-		out: hasBulk(data, false).address,
-		in: hasBulk(data, true).address,
-		dataInterface: data.number,
-		commInterface: comm ? comm.number : data.number,
-	};
-}
-
-const hex2 = (value) => `0x${(value & 0xFF).toString(16).padStart(2, "0")}`;
-
-function describeInterfaces(interfaces) {
-	const kind = ["ctl", "iso", "bulk", "int"];
-
-	return interfaces.map((iface) => `if${iface.number} cls ${hex2(iface.cls)} [` +
-		`${iface.endpoints.map((e) => `${hex2(e.address)} ${kind[e.transfer]}`).join(", ")}]`).join("; ");
-}
-
-/** SignalRGB reports failed USB transfers as negative numbers or as arrays whose length is negative. */
-function transferError(result) {
-	if (typeof result === "number" && result < 0) {
-		return result;
-	}
-
-	return isByteArray(result) && result.length < 0 ? result.length : 0;
-}
+// ---------------------------------------------------------------------------
+// Serial transport: SignalRGB's official @SignalRGB/serial module, the same one its own Turzx LCD and
+// HYTE CNVS plugins use. SignalRGB knows which COM port belongs to this device, so connect() needs no
+// port name.
+// ---------------------------------------------------------------------------
 
 function messageOf(e) {
 	return e && e.message ? e.message : String(e);
 }
 
-class PanelLink {
+/** Bytes from whatever a serial read returned: number arrays, typed arrays, ArrayBuffers or latin-1 strings. */
+function toBytes(value) {
+	if (value === null || value === undefined) {
+		return [];
+	}
+
+	if (typeof value === "string") {
+		return Array.from(value, (c) => c.charCodeAt(0) & 0xFF);
+	}
+
+	if (typeof ArrayBuffer !== "undefined" && value instanceof ArrayBuffer) {
+		return Array.from(new Uint8Array(value));
+	}
+
+	return isByteArray(value) ? Array.from(value, (b) => b & 0xFF) : [];
+}
+
+const hex4 = (value) => (typeof value === "number" ? value.toString(16).toUpperCase().padStart(4, "0") : String(value));
+
+/** serial.write() returns the number of bytes written; -1 (or false) means the write failed. */
+function writeFailed(result) {
+	return result === false || (typeof result === "number" && result < 0);
+}
+
+class SerialLink {
 	constructor() {
 		this.lastKeepAlive = 0;
 		this.resetDiagnostics();
 	}
 
 	resetDiagnostics() {
+		this.portName = "";
+		this.portInfo = "-";
+		this.connectNote = "not tried";
 		this.firstWriteResult = "none";
-		this.lineResults = [];
 		this.infoBytesReceived = 0;
-		this.epOut = USB.EP_OUT;
-		this.epIn = USB.EP_IN;
-		this.commInterface = USB.COMM_INTERFACE;
-		this.dataInterface = USB.DATA_INTERFACE;
-		this.descriptorInfo = "not read";
-		this.endpointSelection = "not run";
-		this.transport = "bulk";
-		this.probeResults = [];
+		this.probeNote = "-";
 	}
 
-	/**
-	 * Reads the configuration descriptor (standard GET_DESCRIPTOR) and uses the endpoints the device
-	 * really has. Panel firmwares differ (CherryUSB demo vs. vendor builds), so nothing is assumed.
-	 */
-	discoverEndpoints() {
-		let raw;
+	/** True if this SignalRGB build gives plugins access to COM ports (the serial module, SignalRGB 2.5+). */
+	static available() {
+		return Boolean(serial) && typeof serial.connect === "function" && typeof serial.write === "function" &&
+			typeof serial.isConnected === "function";
+	}
 
+	isOpen() {
 		try {
-			raw = device.control_transfer(0x80, 0x06, 0x0200, 0x0000, [], 255, 1000);
+			return serial.isConnected() === true;
 		} catch (e) {
-			this.descriptorInfo = `read failed (${messageOf(e)})`;
-
-			return;
-		}
-
-		if (!isByteArray(raw) || raw.length < 9 || raw[1] !== 0x02) {
-			this.descriptorInfo = `unreadable (${describeResult(raw)})`;
-
-			return;
-		}
-
-		const interfaces = parseConfigDescriptor(raw);
-		const picked = pickEndpoints(interfaces);
-		this.descriptorInfo = describeInterfaces(interfaces) || "no interfaces";
-
-		if (picked) {
-			this.epOut = picked.out;
-			this.epIn = picked.in;
-			this.commInterface = picked.commInterface;
-			this.dataInterface = picked.dataInterface;
+			return false;
 		}
 	}
 
-	/**
-	 * SignalRGB opens the endpoints Validate() accepted but uses only one at a time. Make the data
-	 * interface (the one with the bulk endpoints) the active one if SignalRGB lists it.
-	 */
-	selectDataEndpoint() {
-		let list = [];
+	portLabel() {
+		return this.portName || "COM-Port";
+	}
 
+	/** Port name and USB identity as SignalRGB reports them, for the diagnosis. */
+	readPortInfo() {
 		try {
-			list = typeof device.getHidEndpoints === "function" ? device.getHidEndpoints() : [];
+			const name = typeof serial.getPortName === "function" ? serial.getPortName() : "";
+			this.portName = name ? String(name) : this.portName;
 		} catch (e) {
-			list = [];
-		}
-
-		const entries = isByteArray(list) ? Array.from(list) : [];
-		const match = entries.find((e) => e && e.interface === this.dataInterface);
-		const listed = entries.map((e) => (e ? e.interface : "?")).join(",") || "-";
-
-		if (!match || typeof device.set_endpoint !== "function") {
-			this.endpointSelection = `if${this.dataInterface} via Validate (listed: ${listed})`;
-
-			return;
+			// Keep what we had.
 		}
 
 		try {
-			device.set_endpoint(match.interface, match.usage, match.usage_page, match.collection);
-			this.endpointSelection = `set_endpoint if${match.interface} (listed: ${listed})`;
+			const info = typeof serial.getDeviceInfo === "function" ? serial.getDeviceInfo() : null;
+
+			if (info && typeof info === "object") {
+				const id = info.vid !== undefined ? `${hex4(info.vid)}:${hex4(info.pid)}` : "?";
+				this.portInfo = info.driverDesc ? `${id}, ${info.driverDesc}` : id;
+			}
 		} catch (e) {
-			this.endpointSelection = `set_endpoint failed: ${messageOf(e)} (listed: ${listed})`;
+			this.portInfo = `unavailable (${messageOf(e)})`;
 		}
 	}
 
-	write(bytes, transport = this.transport) {
-		if (transport === "bridge") {
-			bridge.sendMessage(bytes);
+	/** Opens the panel's COM port at 115200 8N1 (advisory on CDC-ACM, matches the vendor app). */
+	open() {
+		if (!SerialLink.available()) {
+			this.connectNote = "serial module missing";
+			throw codedError("no-serial", "SignalRGB serial module not available");
+		}
+
+		if (this.isOpen()) {
+			this.readPortInfo();
+			this.connectNote = "already open";
 
 			return;
 		}
 
-		for (let offset = 0; offset < bytes.length; offset += USB.CHUNK_BYTES) {
-			const length = Math.min(USB.CHUNK_BYTES, bytes.length - offset);
+		this.disconnect();
+
+		let result;
+
+		try {
+			result = serial.connect({ baudRate: SERIAL.BAUD_RATE, dataBits: 8, stopBits: "One", parity: "None" });
+		} catch (e) {
+			this.readPortInfo();
+			this.connectNote = `failed (${messageOf(e)})`;
+			throw codedError("port-busy", `${this.portLabel()}: ${messageOf(e)}`);
+		}
+
+		this.readPortInfo();
+
+		const open = this.isOpen();
+		this.connectNote = `${open ? "open" : "not open"} (${describeResult(result)})`;
+
+		if (!open) {
+			throw codedError("port-busy", `${this.portLabel()} could not be opened`);
+		}
+	}
+
+	disconnect() {
+		try {
+			if (typeof serial.disconnect === "function") {
+				serial.disconnect();
+			}
+		} catch (e) {
+			// Nothing was open.
+		}
+	}
+
+	/** Writes all bytes; throws if SignalRGB reports a failed write or the port went away. */
+	write(bytes) {
+		for (let offset = 0; offset < bytes.length; offset += SERIAL.CHUNK_BYTES) {
+			const length = Math.min(SERIAL.CHUNK_BYTES, bytes.length - offset);
 			const chunk = new Array(length);
 
 			for (let i = 0; i < length; i++) {
-				chunk[i] = bytes[offset + i];
+				chunk[i] = bytes[offset + i] & 0xFF;
 			}
 
-			const result = device.bulk_transfer(this.epOut, chunk, length);
+			this.writeChunk(chunk);
+		}
+	}
+
+	writeChunk(chunk) {
+		let pending = chunk;
+
+		// A short (positive) count means only part was taken: send the rest. Bounded, so a port that keeps
+		// taking almost nothing cannot hang the render thread; what is left then is an error, never dropped.
+		for (let attempt = 0; pending.length > 0; attempt++) {
+			if (attempt >= SERIAL.MAX_WRITE_ATTEMPTS) {
+				throw codedError("serial-write", `write stalled (${pending.length} B left)`);
+			}
+
+			let result;
+
+			try {
+				result = serial.write(pending);
+			} catch (e) {
+				throw codedError("serial-write", `write failed (${messageOf(e)})`);
+			}
 
 			if (this.firstWriteResult === "none") {
 				this.firstWriteResult = describeResult(result);
 			}
 
-			// libusb error codes, e.g. -1 (I/O, endpoint not on the active interface) or -12 (driver not supported).
-			const error = transferError(result);
-
-			if (error) {
-				throw codedError("usb-write", `USB write error ${error}`);
+			if (writeFailed(result) || (result === 0 && !this.isOpen())) {
+				throw codedError("serial-write", `write failed (${describeResult(result)})`);
 			}
+
+			pending = typeof result === "number" && result > 0 && result < pending.length ? pending.slice(result) : [];
 		}
 	}
 
-	/** Returns received bytes (possibly none), or null if the read itself failed. */
-	readChunk() {
-		const data = device.bulk_transfer(this.epIn, [], USB.READ_BYTES);
-
-		if (transferError(data)) {
-			return null;
+	/** Up to `max` received bytes, waiting at most `timeoutMs`; null if this SignalRGB build cannot read. */
+	read(max, timeoutMs) {
+		if (typeof serial.read === "function") {
+			return toBytes(serial.read(max, timeoutMs));
 		}
 
-		return isByteArray(data) ? data : [];
+		if (typeof serial.readAll === "function") {
+			return toBytes(serial.readAll());
+		}
+
+		return null;
 	}
 
-	/** CDC SET_LINE_CODING (115200 8N1) and SET_CONTROL_LINE_STATE (DTR + RTS), as the vendor app does. */
-	openLine() {
-		const requests = [
-			["line coding", 0x20, 0x0000, [0x00, 0xC2, 0x01, 0x00, 0x00, 0x00, 0x08]],
-			["DTR/RTS", 0x22, 0x0003, []],
-		];
-
-		for (const [label, request, value, data] of requests) {
-			try {
-				const result = device.control_transfer(0x21, request, value, this.commInterface, data, data.length, 1000);
-				this.lineResults.push(`${label}: ${describeResult(result)}`);
-			} catch (e) {
-				this.lineResults.push(`${label}: failed (${messageOf(e)})`);
+	/** Drops stale bytes (e.g. a late answer from before a reconnect). */
+	drain() {
+		try {
+			if (typeof serial.readAll === "function") {
+				serial.readAll();
 			}
+		} catch (e) {
+			// Nothing buffered.
 		}
 	}
 
 	/** JPEG end-of-image markers flush a half-received frame, then four zero bytes (vendor app sequence). */
-	flush(transport = this.transport) {
-		this.write([0xFF, 0xD9, 0xFF, 0xD9], transport);
+	flush() {
+		this.write([0xFF, 0xD9, 0xFF, 0xD9]);
 		device.pause(50);
-		this.write([0x00, 0x00, 0x00, 0x00], transport);
+		this.write([0x00, 0x00, 0x00, 0x00]);
 		device.pause(200);
 	}
 
@@ -587,7 +574,8 @@ class PanelLink {
 		this.lastKeepAlive = now;
 	}
 
-	close() {
+	/** Hands the panel back to its own firmware (command exists from firmware 3.1 on). */
+	release() {
 		this.sendCommand(CMD.CLOSE);
 	}
 
@@ -595,34 +583,35 @@ class PanelLink {
 		this.write(buildImageEnvelope(avoidMagicCollision(jpeg)));
 	}
 
-	/** Sends 0x06 via `transport` and collects the JSON reply from the bulk IN endpoint. */
-	requestInfo(transport, timeoutMs) {
-		try {
-			this.write(buildControlFrame(CMD.GET_INFO), transport);
-		} catch (e) {
-			return { reply: null, note: `write failed (${messageOf(e)})` };
-		}
+	/**
+	 * Sends the info request (0x06) and collects the JSON reply. A panel that stays silent is not an error:
+	 * some firmwares only answer while DTR is set, and frames are accepted either way.
+	 */
+	requestInfo(timeoutMs) {
+		this.drain();
+		this.sendCommand(CMD.GET_INFO);
 
 		const deadline = Date.now() + timeoutMs;
 		const buffer = [];
 
-		for (let attempt = 0; attempt < USB.READ_ATTEMPTS && Date.now() < deadline; attempt++) {
+		while (Date.now() < deadline) {
+			const started = Date.now();
 			let chunk;
 
 			try {
-				chunk = this.readChunk();
+				chunk = this.read(SERIAL.READ_BYTES, SERIAL.READ_SLICE_MS);
 			} catch (e) {
 				return { reply: null, note: `read failed (${messageOf(e)})` };
 			}
 
 			if (chunk === null) {
-				return { reply: null, note: "read error" };
+				return { reply: null, note: "read not supported" };
 			}
 
 			this.infoBytesReceived += chunk.length;
 
 			for (let i = 0; i < chunk.length; i++) {
-				buffer.push(chunk[i] & 0xFF);
+				buffer.push(chunk[i]);
 			}
 
 			const reply = extractReply(buffer);
@@ -631,232 +620,15 @@ class PanelLink {
 				return { reply, note: `reply ${buffer.length} B` };
 			}
 
-			if (chunk.length === 0) {
-				device.pause(10);
+			// read() normally waits for data itself; only pause if it returned at once.
+			if (chunk.length === 0 && Date.now() - started < 5) {
+				device.pause(SERIAL.READ_SLICE_MS);
 			}
 		}
 
 		return { reply: null, note: `no reply (${buffer.length} B)` };
 	}
-
-	/**
-	 * Tries SignalRGB's bulk_transfer() on the discovered endpoints: flush, then the info request.
-	 * Returns the info reply (or null if the panel stays silent). Throws if writing fails, e.g. because
-	 * SignalRGB opened an interface without these endpoints; the caller then falls back to the bridge.
-	 */
-	probe(timeoutMs) {
-		try {
-			this.flush("bulk");
-		} catch (e) {
-			this.probeResults.push(`bulk: ${messageOf(e)}`);
-			throw e;
-		}
-
-		const { reply, note } = this.requestInfo("bulk", timeoutMs);
-		this.probeResults.push(`bulk: ${note}`);
-		this.transport = "bulk";
-
-		return reply;
-	}
 }
-
-// ---------------------------------------------------------------------------
-// Bridge transport: SignalRGB opens only interface 0 of a raw USB device, but this panel's bulk
-// endpoints are on interface 1. The finished byte stream then goes over UDP to the local helper
-// "Jungle Leopard LCD Bridge" (bridge/ folder), which writes it to the panel's COM port.
-// ---------------------------------------------------------------------------
-
-const BRIDGE = {
-	HOST: "127.0.0.1",
-	DATA_PORT: 48960,
-	STATUS_PORT: 48961,
-	CHUNK_BYTES: 8192,
-	HEADER_BYTES: 13,
-	STATUS_TIMEOUT_MS: 4000,
-};
-
-/** Text of whatever SignalRGB hands to a UDP "message" callback (string, byte array or {data}). */
-function textOf(value) {
-	if (typeof value === "string") {
-		return value;
-	}
-
-	if (isByteArray(value)) {
-		let text = "";
-
-		for (let i = 0; i < value.length; i++) {
-			text += String.fromCharCode(value[i] & 0xFF);
-		}
-
-		return text;
-	}
-
-	return value && typeof value === "object" && value.data !== undefined ? textOf(value.data) : "";
-}
-
-/** One UDP datagram: "JLB1" | type 1 | message id u32 | chunk index u16 | chunk count u16 | payload. */
-function bridgeDatagram(id, index, count, bytes, start, end) {
-	const packet = new Array(BRIDGE.HEADER_BYTES + end - start);
-	packet[0] = 0x4A;
-	packet[1] = 0x4C;
-	packet[2] = 0x42;
-	packet[3] = 0x31;
-	packet[4] = 0x01;
-	packet[5] = id & 0xFF;
-	packet[6] = (id >>> 8) & 0xFF;
-	packet[7] = (id >>> 16) & 0xFF;
-	packet[8] = (id >>> 24) & 0xFF;
-	packet[9] = index & 0xFF;
-	packet[10] = (index >> 8) & 0xFF;
-	packet[11] = count & 0xFF;
-	packet[12] = (count >> 8) & 0xFF;
-
-	for (let i = start, o = BRIDGE.HEADER_BYTES; i < end; i++, o++) {
-		packet[o] = bytes[i] & 0xFF;
-	}
-
-	return packet;
-}
-
-class BridgeClient {
-	constructor() {
-		this.reset();
-	}
-
-	reset() {
-		this.socket = null;
-		this.api = "none";
-		this.error = "";
-		this.listening = "no";
-		this.messageId = 0;
-		this.status = "";
-		this.statusAt = 0;
-		this.openedAt = 0;
-		this.messagesSent = 0;
-	}
-
-	/** Uses SignalRGB's udp feature: a socket (send + status listener) or the older udp.send(). */
-	open(now) {
-		if (this.api !== "none") {
-			return true;
-		}
-
-		try {
-			if (typeof device.addFeature === "function") {
-				device.addFeature("udp");
-			}
-		} catch (e) {
-			this.error = `addFeature: ${messageOf(e)}`;
-		}
-
-		const api = typeof udp === "undefined" ? null : udp;
-
-		if (!api) {
-			this.error = this.error || "SignalRGB udp feature not available";
-
-			return false;
-		}
-
-		this.openedAt = now;
-
-		if (typeof api.createSocket === "function") {
-			this.socket = api.createSocket();
-			this.api = "socket";
-
-			try {
-				this.socket.on("message", (...args) => this.onMessage(args));
-				this.socket.bind(BRIDGE.STATUS_PORT);
-				this.listening = "yes";
-			} catch (e) {
-				this.listening = `failed (${messageOf(e)})`;
-			}
-
-			return true;
-		}
-
-		if (typeof api.send === "function") {
-			this.api = "send";
-			this.listening = "unsupported";
-
-			return true;
-		}
-
-		this.error = "udp offers neither createSocket nor send";
-
-		return false;
-	}
-
-	sendMessage(bytes) {
-		this.messageId = (this.messageId + 1) >>> 0;
-
-		const count = Math.max(1, Math.ceil(bytes.length / BRIDGE.CHUNK_BYTES));
-
-		for (let index = 0; index < count; index++) {
-			const start = index * BRIDGE.CHUNK_BYTES;
-			const packet = bridgeDatagram(this.messageId, index, count, bytes, start, Math.min(bytes.length, start + BRIDGE.CHUNK_BYTES));
-			const result = this.api === "socket"
-				? this.socket.write(packet, BRIDGE.HOST, BRIDGE.DATA_PORT)
-				: udp.send(BRIDGE.HOST, BRIDGE.DATA_PORT, packet);
-
-			if (typeof result === "number" && result < 0) {
-				throw codedError("bridge-send", `UDP send error ${result}`);
-			}
-		}
-
-		this.messagesSent++;
-	}
-
-	onMessage(args) {
-		for (const arg of args) {
-			const text = textOf(arg);
-
-			if (text.indexOf("JLB1 STATUS") >= 0) {
-				this.status = text;
-				this.statusAt = Date.now();
-
-				return;
-			}
-		}
-	}
-
-	/** Parsed "key=value" pairs of the last status message. */
-	statusFields() {
-		const fields = {};
-
-		for (const part of this.status.split(" ")) {
-			const at = part.indexOf("=");
-
-			if (at > 0) {
-				fields[part.slice(0, at)] = part.slice(at + 1);
-			}
-		}
-
-		return fields;
-	}
-
-	describe() {
-		const fields = this.statusFields();
-		const status = this.status
-			? `${fields.state || "?"} ${fields.port || ""} (msgs ${fields.msgs || 0}, v${fields.version || "?"})`
-			: "no answer yet";
-
-		return `${this.api}, listen ${this.listening}, sent ${this.messagesSent}, bridge ${status}`;
-	}
-
-	close() {
-		if (this.socket) {
-			try {
-				this.socket.close();
-			} catch (e) {
-				// Socket already gone.
-			}
-		}
-
-		this.reset();
-	}
-}
-
-const bridge = new BridgeClient();
 
 // ---------------------------------------------------------------------------
 // Device info (reply to 0x06 is JSON, field names vary between firmwares)
@@ -2024,13 +1796,43 @@ const MESSAGES = {
 		priority: 1,
 		de: {
 			title: "Verbindung zum Display unterbrochen",
-			body: "Die Übertragung zum Display ist fehlgeschlagen ({detail}). Ist die 'Jungle Leopard LCD Bridge' " +
-				"installiert (Anleitung Schritt 2)? Das Plugin versucht, die Verbindung wiederherzustellen.",
+			body: "Das Senden an das Display ist fehlgeschlagen ({detail}). Das Plugin verbindet sich automatisch neu. " +
+				"Wurde das Display abgesteckt, oder hat ein anderes Programm den COM-Port übernommen?",
 		},
 		en: {
 			title: "Lost connection to the display",
-			body: "Sending to the display failed ({detail}). Is the 'Jungle Leopard LCD Bridge' installed " +
-				"(setup step 2)? The plugin is trying to reconnect.",
+			body: "Sending to the display failed ({detail}). The plugin reconnects automatically. " +
+				"Was the display unplugged, or did another program take over its COM port?",
+		},
+	},
+	PORT_BUSY: {
+		severity: "error",
+		priority: 1,
+		de: {
+			title: "COM-Port des Displays belegt",
+			body: "SignalRGB kann {detail} nicht öffnen, ein anderes Programm benutzt ihn. Bitte die Hersteller-App " +
+				"ganz beenden (auch im Infobereich) und die alte 'Jungle Leopard LCD Bridge' entfernen, falls " +
+				"installiert. Neuer Versuch alle paar Sekunden.",
+		},
+		en: {
+			title: "Display COM port in use",
+			body: "SignalRGB cannot open {detail}, another program is using it. Please quit the vendor app " +
+				"completely (check the system tray) and remove the old 'Jungle Leopard LCD Bridge' if it is " +
+				"installed. Retrying every few seconds.",
+		},
+	},
+	SERIAL_UNAVAILABLE: {
+		severity: "error",
+		priority: 1,
+		de: {
+			title: "SignalRGB-Update nötig",
+			body: "Das Display ist über einen COM-Port angeschlossen, und diese SignalRGB-Version gibt Plugins darauf " +
+				"noch keinen Zugriff. Bitte SignalRGB aktualisieren.",
+		},
+		en: {
+			title: "SignalRGB update needed",
+			body: "The display is connected through a COM port, and this SignalRGB version does not give plugins " +
+				"access to COM ports yet. Please update SignalRGB.",
 		},
 	},
 	STARTUP_REPORT: {
@@ -2038,64 +1840,6 @@ const MESSAGES = {
 		priority: 0,
 		de: { title: "Jungle Leopard LCD - Diagnose", body: "{detail}" },
 		en: { title: "Jungle Leopard LCD - diagnostics", body: "{detail}" },
-	},
-	BRIDGE_MISSING: {
-		severity: "error",
-		priority: 1,
-		de: {
-			title: "Bridge nicht erreichbar",
-			body: "SignalRGB kann dieses Display nicht direkt ansprechen und schickt die Bilder an das Hilfsprogramm " +
-				"'Jungle Leopard LCD Bridge'. Es antwortet nicht. Bitte die Bridge installieren bzw. starten " +
-				"(Anleitung im README, Abschnitt Bridge).",
-		},
-		en: {
-			title: "Bridge not reachable",
-			body: "SignalRGB cannot drive this display directly and sends the frames to the helper " +
-				"'Jungle Leopard LCD Bridge'. It does not answer. Please install or start the bridge " +
-				"(see the README, section Bridge).",
-		},
-	},
-	BRIDGE_NO_PORT: {
-		severity: "error",
-		priority: 1,
-		de: {
-			title: "Display-COM-Port nicht gefunden",
-			body: "Die Bridge läuft, findet aber den COM-Port des Displays nicht. Ist noch der WinUSB-Treiber aus Zadig " +
-				"aktiv? Dann im Geräte-Manager entfernen, bis das Display wieder als 'Serielles USB-Gerät (COMx)' erscheint.",
-		},
-		en: {
-			title: "Display COM port not found",
-			body: "The bridge is running but cannot find the display's COM port. Is the WinUSB driver from Zadig still " +
-				"installed? Remove it in Device Manager until the display shows up as 'USB Serial Device (COMx)' again.",
-		},
-	},
-	BRIDGE_ERROR: {
-		severity: "error",
-		priority: 1,
-		de: {
-			title: "Bridge meldet einen Fehler",
-			body: "Die Bridge kann den COM-Port {detail} nicht benutzen. Ist die Hersteller-App noch geöffnet? " +
-				"Details im Log der Bridge (Rechtsklick auf ihr Symbol im Infobereich).",
-		},
-		en: {
-			title: "Bridge reports an error",
-			body: "The bridge cannot use COM port {detail}. Is the vendor app still open? " +
-				"Details are in the bridge log (right-click its tray icon).",
-		},
-	},
-	PANEL_NO_REPLY: {
-		severity: "warning",
-		priority: 1,
-		de: {
-			title: "Display antwortet nicht",
-			body: "SignalRGB hat das Display erkannt, bekommt aber keine Antwort. Meist belegt die Hersteller-App " +
-				"das Display noch. Zeigt das Display trotzdem ein Bild, kann diese Meldung ignoriert werden.",
-		},
-		en: {
-			title: "Display does not respond",
-			body: "SignalRGB detected the display but gets no answer. Usually the vendor app still holds the " +
-				"display. If the display shows a picture anyway, this message can be ignored.",
-		},
 	},
 };
 
@@ -2245,6 +1989,16 @@ class FramePipeline {
 		this.mapKey = "";
 		this.map = null;
 		this.lastRaw = null;
+		this.rgbFormat = true;
+	}
+
+	/** A black panel frame, repeated while the display is switched off. */
+	blackFrame() {
+		if (!this.black) {
+			this.black = this.encoder.encode(new Uint8Array(PANEL_WIDTH * PANEL_HEIGHT * 3), PANEL_WIDTH, PANEL_HEIGHT, STATUS_QUALITY);
+		}
+
+		return this.black;
 	}
 
 	switchToRaw(reason, now) {
@@ -2330,16 +2084,39 @@ class FramePipeline {
 		return this.rawFrame(settings, now);
 	}
 
-	rawFrame(settings, now) {
+	/** The face as raw pixels: plain RGB where SignalRGB offers it (2.5+), otherwise a BMP. Null if neither. */
+	rawSource(settings) {
+		if (this.rgbFormat) {
+			const [width, height] = viewportFor(settings);
+			const rgb = LCD.getFrame({ format: "RGB" });
+
+			if (isByteArray(rgb) && rgb.length === width * height * 3) {
+				return { kind: "rgb", bytes: rgb, width, height };
+			}
+		}
+
 		const bmp = LCD.getFrame({ format: "BMP" });
 
 		if (!isByteArray(bmp) || bmp.length === 0) {
+			return null;
+		}
+
+		// BMP works where RGB did not: stop asking for RGB until the next reset.
+		this.rgbFormat = false;
+
+		return { kind: "bmp", bytes: bmp };
+	}
+
+	rawFrame(settings, now) {
+		const source = this.rawSource(settings);
+
+		if (!source) {
 			return this.rawUnavailable(settings, now);
 		}
 
 		this.emptySince = 0;
 
-		const signature = `${hashBytes(bmp)}|${settings.rotation}|${settings.fill.join()}|${settings.quality}`;
+		const signature = `${source.kind}|${hashBytes(source.bytes)}|${settings.rotation}|${settings.fill.join()}|${settings.quality}`;
 
 		if (this.lastRaw && this.lastRaw.signature === signature) {
 			return this.lastRaw.frame;
@@ -2348,7 +2125,7 @@ class FramePipeline {
 		let image;
 
 		try {
-			image = decodeBmp(bmp);
+			image = source.kind === "rgb" ? { width: source.width, height: source.height, rgb: source.bytes } : decodeBmp(source.bytes);
 		} catch (e) {
 			const reason = this.lastJpegReason || e.code || "bmp-format";
 
@@ -2408,6 +2185,7 @@ class FramePipeline {
 /** SignalRGB exposes user properties as globals named after the property; undefined until it sets them. */
 function readUserProperties() {
 	return {
+		displayEnabled: typeof displayEnabled === "undefined" ? undefined : displayEnabled,
 		faceLayout: typeof faceLayout === "undefined" ? undefined : faceLayout,
 		mountOrientation: typeof mountOrientation === "undefined" ? undefined : mountOrientation,
 		sideFillColor: typeof sideFillColor === "undefined" ? undefined : sideFillColor,
@@ -2425,6 +2203,7 @@ function readSettings() {
 	const knownOrientation = Object.prototype.hasOwnProperty.call(ORIENTATION_DEGREES, p.mountOrientation);
 
 	return {
+		displayOn: p.displayEnabled !== false && p.displayEnabled !== "false",
 		layout: p.faceLayout === LAYOUT_SQUARE ? LAYOUT_SQUARE : LAYOUT_FULL,
 		rotation: knownOrientation ? ORIENTATION_DEGREES[p.mountOrientation] : 0,
 		fill: hexToRgb(p.sideFillColor),
@@ -2437,7 +2216,7 @@ function readSettings() {
 	};
 }
 
-const link = new PanelLink();
+const link = new SerialLink();
 const encoder = new JpegEncoder();
 const pipeline = new FramePipeline(encoder);
 const alerts = new Alerts();
@@ -2457,8 +2236,8 @@ function createState() {
 		framesSent: 0,
 		lastPipelineError: "",
 		lastReconnectError: "",
-		bridgeMode: false,
-		bridgeReported: false,
+		probed: false,
+		reportedOk: false,
 	};
 }
 
@@ -2472,6 +2251,11 @@ function configureViewport() {
 	state.viewport = [width, height];
 	pipeline.reset();
 	log(`LCD face viewport ${width}x${height} (${state.settings.layout}, rotation ${state.settings.rotation}°).`);
+}
+
+/** Backlight level actually sent to the panel: 0 while the display is switched off in SignalRGB. */
+function backlightLevel(settings) {
+	return settings.displayOn ? settings.brightness : 0;
 }
 
 /** Picks up parameter changes; called from Render and from the on<Property>Changed callbacks. */
@@ -2488,8 +2272,15 @@ function applySettings() {
 		configureViewport();
 	}
 
-	if (previous.brightness !== next.brightness && state.linkOk) {
-		guardedLink(() => link.setBacklight(next.brightness));
+	if (backlightLevel(previous) !== backlightLevel(next) && state.linkOk) {
+		guardedLink(() => link.setBacklight(backlightLevel(next)));
+	}
+
+	if (previous.displayOn !== next.displayOn) {
+		log(`Display switched ${next.displayOn ? "on" : "off"}.`);
+		state.lastHash = 0;
+		state.lastSendAt = 0;
+		alerts.clear("frame");
 	}
 
 	if (previous.language !== next.language) {
@@ -2513,24 +2304,59 @@ function guardedLink(action) {
 	}
 }
 
+/** Explains a transport failure. The port is closed, so the next recovery attempt opens it afresh. */
 function onLinkError(e, now) {
 	state.linkOk = false;
 	state.nextRecoveryAt = now + RECOVERY_INTERVAL_MS;
-	alerts.raiseMessage("link", "LINK_LOST", state.settings.language, errorText(e));
+	link.disconnect();
+
+	const language = state.settings.language;
+	const code = e && e.code;
+
+	if (code === "no-serial") {
+		alerts.raiseMessage("link", "SERIAL_UNAVAILABLE", language, "");
+	} else if (code === "port-busy") {
+		alerts.raiseMessage("link", "PORT_BUSY", language, link.portLabel());
+	} else {
+		alerts.raiseMessage("link", "LINK_LOST", language, errorText(e));
+	}
 }
 
 function enterLive() {
-	link.setBacklight(state.settings.brightness);
+	link.setBacklight(backlightLevel(state.settings));
 	link.keepAlive(Date.now());
 	device.pause(100);
 	state.linkOk = true;
 	state.lastHash = 0;
+	state.lastSendAt = 0;
 }
 
-function startPanel() {
-	link.openLine();
+/**
+ * Opens the COM port if needed, resynchronizes the panel's parser, identifies the panel (once) and enters
+ * live mode. Returns false, with the port closed again, if a different display answers.
+ */
+function connectPanel() {
+	link.open();
 	link.flush();
+
+	if (!state.probed) {
+		const { reply, note } = link.requestInfo(INFO_TIMEOUT_MS);
+		link.probeNote = note;
+		state.probed = true;
+
+		const verdict = identifyPanel(reply);
+
+		if (verdict.status === "mismatch") {
+			alerts.raiseMessage("panel", "PANEL_MISMATCH", state.settings.language, verdict.reason);
+			link.disconnect();
+
+			return false;
+		}
+	}
+
 	enterLive();
+
+	return true;
 }
 
 function tryRecover(now) {
@@ -2541,10 +2367,24 @@ function tryRecover(now) {
 	state.nextRecoveryAt = now + RECOVERY_INTERVAL_MS;
 
 	try {
-		startPanel();
+		if (!connectPanel()) {
+			state.active = false;
+			alerts.clear("link");
+			reportStartup("");
+
+			return;
+		}
+
 		alerts.clear("link");
 		log("Connection to the panel restored.");
+
+		// The startup diagnosis showed the failure: replace it with the working state.
+		if (!state.reportedOk) {
+			reportStartup("");
+		}
 	} catch (e) {
+		link.disconnect();
+
 		// Retried every few seconds: only log when the reason changes.
 		if (errorText(e) !== state.lastReconnectError) {
 			log(`Reconnect failed: ${errorText(e)}`);
@@ -2567,27 +2407,19 @@ function identifyPanel(reply) {
 	return verdict;
 }
 
-/** One line summarizing how SignalRGB's USB layer behaved on this machine. */
+/** One line summarizing how the connection to the panel went on this machine. */
 function diagnosisText(failure) {
 	const info = state.panelInfo;
 	const version = info && !Number.isNaN(info.version) ? `, FW ${info.version}` : "";
-	const reply = info ? `${link.infoBytesReceived} B, ${info.model || "unknown model"}${version}` : `none (${link.infoBytesReceived} B)`;
+	const reply = info ? `${link.infoBytesReceived} B, ${info.model || "unknown model"}${version}` : `none (${link.probeNote})`;
 	const parts = [
 		`Plugin ${PLUGIN_VERSION}`,
-		`Validate: ${offeredEndpoints.length ? offeredEndpoints.join(",") : "-"}`,
-		`USB: ${link.descriptorInfo}`,
-		`Endpoints: OUT ${hex2(link.epOut)} IN ${hex2(link.epIn)}, control if${link.commInterface}`,
-		`Active: ${link.endpointSelection}`,
-		`Line: ${link.lineResults.join("; ") || "-"}`,
+		`Serial: ${SerialLink.available() ? "yes" : "missing"}`,
+		`Port: ${link.portName || "?"} (${link.portInfo})`,
+		`Connect: ${link.connectNote}`,
 		`Write: ${link.firstWriteResult}`,
-		`Probe: ${link.probeResults.join("; ") || "-"}`,
-		`Transport: ${link.transport}`,
 		`Reply: ${reply}`,
 	];
-
-	if (state.bridgeMode || bridge.error) {
-		parts.push(`Bridge: ${bridge.error || bridge.describe()}`);
-	}
 
 	if (failure) {
 		parts.push(`Error: ${failure}`);
@@ -2598,16 +2430,9 @@ function diagnosisText(failure) {
 
 /** Logs the startup diagnosis and, unless disabled, shows it as a SignalRGB notification. */
 function reportStartup(failure) {
-	if (typeof device.getDeviceInfo === "function") {
-		try {
-			log(`USB device: ${JSON.stringify(device.getDeviceInfo())}`);
-		} catch (e) {
-			log(`USB device info unavailable: ${errorText(e)}`);
-		}
-	}
-
 	const text = diagnosisText(failure);
 	log(`Diagnosis: ${text}`);
+	state.reportedOk = !failure;
 
 	if (state.settings.report) {
 		alerts.raiseMessage("report", "STARTUP_REPORT", state.settings.language, text);
@@ -2617,89 +2442,25 @@ function reportStartup(failure) {
 export function Initialize() {
 	state = createState();
 	alerts.clearAll();
-	bridge.close();
 	link.resetDiagnostics();
 	log(`Plugin ${PLUGIN_VERSION} starting.`);
-	link.discoverEndpoints();
-	link.selectDataEndpoint();
 
 	try {
-		link.openLine();
-
-		const verdict = identifyPanel(link.probe(INFO_TIMEOUT_MS));
-
-		if (verdict.status === "mismatch") {
-			alerts.raiseMessage("panel", "PANEL_MISMATCH", state.settings.language, verdict.reason);
+		if (!connectPanel()) {
 			reportStartup("");
 
 			return;
 		}
 
-		if (verdict.reason === "no-reply") {
-			alerts.raiseMessage("panel", "PANEL_NO_REPLY", state.settings.language, "");
-		}
-
-		enterLive();
 		reportStartup("");
 	} catch (e) {
-		log(`Direct USB is not usable (${errorText(e)}), using the bridge.`);
-		startBridge(e);
+		log(`Could not start the panel: ${errorText(e)}`);
+		reportStartup(errorText(e));
+		onLinkError(e, Date.now());
 	}
 
 	state.active = true;
 	configureViewport();
-}
-
-/** Fallback when SignalRGB cannot write to the panel's bulk endpoint: hand the stream to the local bridge. */
-function startBridge(usbError) {
-	if (!bridge.open(Date.now())) {
-		const reason = `${errorText(usbError)}; bridge: ${bridge.error}`;
-		reportStartup(reason);
-		onLinkError(codedError("no-transport", reason), Date.now());
-
-		return;
-	}
-
-	link.transport = "bridge";
-	state.bridgeMode = true;
-
-	try {
-		link.flush();
-		enterLive();
-		reportStartup("");
-	} catch (e) {
-		reportStartup(errorText(e));
-		onLinkError(e, Date.now());
-	}
-}
-
-/** Turns the bridge's status messages into SignalRGB notifications (only if they can be received at all). */
-function monitorBridge(now) {
-	if (bridge.listening !== "yes") {
-		return;
-	}
-
-	const language = state.settings.language;
-	const fields = bridge.statusFields();
-	const fresh = bridge.statusAt > 0 && now - bridge.statusAt <= BRIDGE.STATUS_TIMEOUT_MS;
-
-	if (!fresh) {
-		if (now - bridge.openedAt > BRIDGE.STATUS_TIMEOUT_MS) {
-			alerts.raiseMessage("bridge", "BRIDGE_MISSING", language, "");
-		}
-	} else if (fields.state === "noport") {
-		alerts.raiseMessage("bridge", "BRIDGE_NO_PORT", language, "");
-	} else if (fields.state === "error") {
-		alerts.raiseMessage("bridge", "BRIDGE_ERROR", language, fields.port || "?");
-	} else {
-		alerts.clear("bridge");
-	}
-
-	// Refresh the diagnosis once the bridge has answered, or once it is clear that it does not.
-	if (!state.bridgeReported && (fresh || now - bridge.openedAt > BRIDGE.STATUS_TIMEOUT_MS)) {
-		state.bridgeReported = true;
-		reportStartup("");
-	}
 }
 
 function updateFrameAlerts(frame) {
@@ -2729,6 +2490,20 @@ function produceFrame(now) {
 	}
 }
 
+/**
+ * Display switched off in SignalRGB: the backlight is at 0 and a black frame is repeated, so the panel
+ * stays in live mode and its own animation does not come back.
+ */
+function holdDark(now) {
+	if (now - state.lastSendAt < DISPLAY_OFF_REFRESH_MS) {
+		return;
+	}
+
+	if (guardedLink(() => link.sendJpeg(pipeline.blackFrame()))) {
+		state.lastSendAt = now;
+	}
+}
+
 export function Render() {
 	if (!state.active) {
 		return;
@@ -2738,10 +2513,6 @@ export function Render() {
 
 	const now = Date.now();
 
-	if (state.bridgeMode) {
-		monitorBridge(now);
-	}
-
 	if (!state.linkOk) {
 		tryRecover(now);
 
@@ -2749,6 +2520,12 @@ export function Render() {
 	}
 
 	if (now - link.lastKeepAlive >= KEEPALIVE_INTERVAL_MS && !guardedLink(() => link.keepAlive(now))) {
+		return;
+	}
+
+	if (!state.settings.displayOn) {
+		holdDark(now);
+
 		return;
 	}
 
@@ -2784,14 +2561,17 @@ export function Shutdown(SystemSuspending) {
 	alerts.clearAll();
 
 	if (!wasActive || !state.linkOk) {
+		link.disconnect();
+
 		return;
 	}
 
 	const settings = readSettings();
-	log(`Shutdown (${SystemSuspending ? "system suspend" : "SignalRGB"}): ${settings.shutdown}.`);
+	const darken = SystemSuspending || settings.shutdown === SHUTDOWN_BACKLIGHT_OFF;
+	log(`Shutdown (${SystemSuspending ? "system suspend" : "SignalRGB"}): ${darken ? "backlight off" : "release to panel"}.`);
 
 	try {
-		if (settings.shutdown === SHUTDOWN_BACKLIGHT_OFF) {
+		if (darken) {
 			link.setBacklight(0);
 		}
 
@@ -2799,15 +2579,19 @@ export function Shutdown(SystemSuspending) {
 
 		// Close (0x21) exists from firmware 3.1 on; older panels simply leave live mode after ~1.5 s.
 		if (state.panelInfo && state.panelInfo.version >= 3.1) {
-			link.close();
+			link.release();
 		}
+
+		device.pause(50);
 	} catch (e) {
 		log(`Shutdown write failed: ${errorText(e)}`);
 	}
 
-	bridge.close();
+	// Free the COM port, so the vendor app can take the panel over again.
+	link.disconnect();
 }
 
+export function ondisplayEnabledChanged() { applySettings(); }
 export function onfaceLayoutChanged() { applySettings(); }
 export function onmountOrientationChanged() { applySettings(); }
 export function onsideFillColorChanged() { applySettings(); }
@@ -2821,14 +2605,13 @@ export function onstartupReportChanged() { applySettings(); }
 /** Internal building blocks, exported for the test suite only. SignalRGB ignores this export. */
 export const _internals = Object.freeze({
 	PANEL_WIDTH, PANEL_HEIGHT, MAX_JPEG_BYTES, TARGET_JPEG_BYTES, KEEPALIVE_INTERVAL_MS, STILL_REFRESH_MS,
-	NO_FRAME_GRACE_MS, USB, CMD, LAYOUT_FULL, LAYOUT_SQUARE, ORIENTATION_DEGREES,
-	sum16, buildControlFrame, buildImageEnvelope, avoidMagicCollision, extractReply,
-	parseConfigDescriptor, pickEndpoints, describeInterfaces,
-	BRIDGE, BridgeClient, bridgeDatagram, textOf, getBridge: () => bridge,
+	NO_FRAME_GRACE_MS, DISPLAY_OFF_REFRESH_MS, SERIAL, CMD, LAYOUT_FULL, LAYOUT_SQUARE, ORIENTATION_DEGREES,
+	sum16, buildControlFrame, buildImageEnvelope, avoidMagicCollision, extractReply, toBytes, SerialLink,
 	parseDeviceInfo, assessPanel, inspectJpeg, panelIncompatibility, decodeBmp,
 	viewportFor, buildPixelMap, composeFrame, JpegEncoder, FONT, wrapText, renderStatusScreen,
 	localizedMessage, describeReason, MESSAGES, REASONS,
 	getState: () => state,
+	getLink: () => link,
 });
 
 // eslint-disable-next-line max-len

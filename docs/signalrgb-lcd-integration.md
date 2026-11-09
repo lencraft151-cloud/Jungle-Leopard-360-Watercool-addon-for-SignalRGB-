@@ -3,8 +3,8 @@
 Dieses Dokument hält fest, wie SignalRGB LCD-Faces lädt und rendert, ob diese Infrastruktur für
 Drittanbieter-LCDs zugänglich ist, und wie das Plugin darauf aufbaut.
 
-Stand der Untersuchung: November 2026. Grundlage sind der Development-Branch des offiziellen Repos
-`signalrgb/signal-plugins` (Stand 2025-09) und die öffentlichen SignalRGB-Changelogs.
+Stand der Untersuchung: November 2026. Grundlage sind die Branches `Development` (Stand 2025-09) und `beta`
+(Stand 2026-01) des offiziellen Repos `signalrgb/signal-plugins` und die öffentlichen SignalRGB-Changelogs.
 
 ## 1. Wie SignalRGB LCD-Faces lädt und rendert
 
@@ -24,7 +24,7 @@ Stand der Untersuchung: November 2026. Grundlage sind der Development-Branch des
 
 ```ts
 LCD.initialize({ width: number, height: number, circular?: boolean }): void
-LCD.getFrame({ format: "JPEG" | "PNG" | "BMP" }): number[]
+LCD.getFrame({ format: "JPEG", quality?: number } | { format: "PNG" | "BMP" | "RGBA" | "RGB" }): number[]
 ```
 
 1. Das Geräte-Plugin meldet `DeviceType() → "lcd"` und ruft einmal `LCD.initialize()` mit der Displaygröße auf.
@@ -54,10 +54,12 @@ auflisten könnte, gibt es dagegen nicht. Das ist aber auch nicht nötig, weil S
 
 **Grenzen, die sich bei der Untersuchung gezeigt haben:**
 
-1. **Transport.** Plugins können nur über `HID`, `rawusb` (libusb) und `SMBUS` mit Hardware sprechen, dazu
-   kommen Netzwerkmodule. Eine serielle Schnittstelle (COM-Port) gibt es nicht. Das Jungle-Leopard-Display ist
-   aber ein USB-CDC-Gerät, also ein virtueller COM-Port. Lösung: Raw-USB-Bulk-Transfers direkt auf das
-   CDC-Daten-Interface. Unter Windows setzt das den WinUSB-Treiber voraus, siehe README.
+1. **Transport.** Das Jungle-Leopard-Display ist ein USB-CDC-Gerät, also ein virtueller COM-Port. Im
+   `Development`-Branch konnten Plugins nur über `HID`, `rawusb` (libusb) und `SMBUS` mit Hardware sprechen; die
+   Versionen 1.0.x versuchten deshalb Raw-USB, 1.1.0 eine Bridge (siehe 6.). Seit SignalRGB 2.5 gibt es das
+   offizielle Modul **`@SignalRGB/serial`** mit `Type() → "serial"` (Branch `beta`: `@SignalRGB/Serial/serial.d.ts`,
+   genutzt von `Plugins/Turzx/Turzx_LCD_Controller.js` – ebenfalls ein LCD – und `Plugins/Hyte/CNVS.js`). Darüber
+   spricht das Plugin ab 2.0.0 den COM-Port direkt an.
 2. **Seitenverhältnis.** `LCD.initialize` nimmt beliebige Breiten und Höhen an, alle offiziellen LCD-Plugins
    nutzen aber 480×480. Ob jede SignalRGB-Version einen 960×480-Viewport exakt so liefert, ist nicht
    dokumentiert. Das Plugin prüft deshalb jedes Bild und gleicht Abweichungen aus (siehe 4.).
@@ -85,10 +87,12 @@ Das Protokoll stammt aus dem Reverse Engineering der Hersteller-App durch
 ## 4. Aufbau des Plugins
 
 ```
-Initialize: CDC-Leitung (SET_LINE_CODING, DTR/RTS) → Flush → 0x06 Geräteinfo prüfen
+Initialize: serial.connect(115200 8N1) → Flush → 0x06 Geräteinfo prüfen (serial.read in 50-ms-Scheiben)
             → Helligkeit → 0x11 Live → LCD.initialize(Viewport)
-Render:     Keep-alive (≤ 1 s) → Frame-Limit → Frame-Pipeline → Bild senden
-Shutdown:   optional Hintergrundbeleuchtung aus → Flush → 0x21 Close (nur FW ≥ 3.1)
+Render:     Keep-alive (≤ 1 s) → Display aus? schwarzes Bild 1×/s : Frame-Limit → Frame-Pipeline → Bild senden
+Fehler:     Port schließen → Benachrichtigung (belegt / unterbrochen / Update nötig) → alle 2 s neu verbinden
+Shutdown:   Hintergrundbeleuchtung aus (Standby oder auf Wunsch) → Flush → 0x21 Close (nur FW ≥ 3.1)
+            → serial.disconnect(), damit die Hersteller-App das Display wieder übernehmen kann
 ```
 
 **Frame-Pipeline**
@@ -96,7 +100,8 @@ Shutdown:   optional Hintergrundbeleuchtung aus → Flush → 0x21 Close (nur FW
 1. **Durchreichen (Normalfall):** `getFrame({format: "JPEG"})` liefert ein Bild, das bereits 960×480, Baseline,
    4:2:0 und ≤ 80 KB ist. Es wird byte-genau übertragen, ohne Neukodierung und ohne zusätzlichen Qualitätsverlust.
 2. **Umwandeln:** Bei inkompatiblem JPEG, z. B. 4:4:4, progressiv oder falscher Größe, sowie bei Drehung oder
-   quadratischem Layout holt das Plugin `getFrame({format: "BMP"})`. Es dekodiert die Rohpixel, setzt sie
+   quadratischem Layout holt das Plugin Rohpixel, bevorzugt `getFrame({format: "RGB"})`, sonst
+   `getFrame({format: "BMP"})`. Es setzt sie
    zusammen (einpassen, zentrieren, drehen, Füllfarbe) und kodiert sie mit einem eingebauten Baseline-JPEG-Encoder
    (4:2:0). Die Qualität wird dabei an das 80-KB-Limit angepasst. Der Plugin-Sandbox steht kein Bild-Codec zur
    Verfügung, daher ist der Encoder Teil des Plugins. Gegen libjpeg geprüft liegt er bei gleicher Qualitätsstufe
@@ -112,12 +117,12 @@ Format unbekannt, läuft es normal weiter.
 
 | Anforderung | Umsetzung |
 |---|---|
-| 1. Display erscheint als unterstütztes LCD-Gerät | `DeviceType "lcd"`, `Type "rawusb"`, VID/PID `33C3:7788`, Gerätebild |
+| 1. Display erscheint als unterstütztes LCD-Gerät | `DeviceType "lcd"`, `Type "serial"`, VID/PID `33C3:7788`, Gerätebild |
 | 2. Faces direkt aus der offiziellen Library | Offizielles `@SignalRGB/lcd`; SignalRGB rendert das gewählte Library-Face |
 | 3. Anpassung an 960×480 | Viewport 960×480 (responsive Faces füllen die Fläche); alternativ originalgetreues 480×480, zentriert; Hochkant 480×960 |
 | 4. Animationen, Farben, Texte, dynamische Inhalte | Werden von SignalRGB gerendert; kompatible Bilder gehen unverändert durch; bis 30 fps; 4:2:0 ist das native Format des Panels |
 | 5. Auswahl über die SignalRGB-Oberfläche | Standard-Face-Auswahl von SignalRGB; Plugin-Optionen als Geräteeinstellungen |
-| 6. Anzeige auf dem Display | USB-Bulk-Übertragung im Herstellerprotokoll inkl. Keep-alive |
+| 6. Anzeige auf dem Display | Offizielles `@SignalRGB/serial` auf den COM-Port des Displays, Herstellerprotokoll inkl. Keep-alive; Display an/aus als Geräteeinstellung |
 | 7. Auswahl bleibt nach Neustart erhalten | Face-Auswahl und Geräteeinstellungen speichert SignalRGB pro Gerät |
 | Keine eigene Designbibliothek | Das Plugin enthält keine Faces |
 | Fehlermeldung statt leerer Anzeige | Statusbildschirme auf dem Display und SignalRGB-Benachrichtigungen |
@@ -153,14 +158,28 @@ Format unbekannt, läuft es normal weiter.
   `VID_33C3&PID_7788` in der Registry). Ihren Zustand meldet sie jede Sekunde an `127.0.0.1:48961`; das Plugin
   zeigt daraus Benachrichtigungen (Bridge fehlt, kein COM-Port, Port belegt). Dafür muss das Display den normalen
   Windows-Treiber (usbser, COM-Port) behalten.
+* **Lösung ab Plugin 2.0.0 – offizielles Serial-Modul:** Bei der weiteren Recherche fand sich im `beta`-Branch
+  von `signal-plugins` das Modul `@SignalRGB/serial` (`connect({baudRate, dataBits, stopBits, parity})`,
+  `write(number[]) → number`, `read(maxBytes?, timeout?)`, `readAll()`, `isConnected()`, `disconnect()`,
+  `getPortName()`, `getDeviceInfo()`), eingeführt mit SignalRGB 2.5 (Changelogs: HYTE CNVS ab 2.5.26/2.5.45,
+  Turzx-LCD ab 2.5.39). SignalRGB ordnet Plugins mit `Type "serial"` den COM-Port über VID/PID zu; `connect()`
+  braucht deshalb keinen Portnamen (so macht es auch das offizielle Turzx-Plugin). Damit sind WinUSB und Bridge
+  überflüssig. Die Bridge wurde entfernt; `bridge/uninstall.ps1` bleibt, um eine installierte Bridge zu entfernen.
+* **DTR:** Das Serial-Modul bietet keine Steuerung von DTR/RTS. CherryUSB-Firmwares nehmen Daten auch ohne DTR an,
+  senden aber eventuell keine Antwort. Antwortet das Display nicht auf die Geräteinfo, läuft das Plugin daher
+  normal weiter (nur in der Diagnose vermerkt).
 * **Offen:** Ob das Gerät mit Revision 2.00 dasselbe Bildprotokoll spricht wie die von senesees/yughias
-  dokumentierte Firmware 3.1, zeigt erst der Test über die Bridge.
+  dokumentierte Firmware 3.1 (gleiche USB-ID `33C3:7788`, laut senesees `jl_device.cpp`), zeigt erst der Test
+  am echten Gerät.
 * **Feldnamen der Geräteinfo:** Nur der Modellstring ist bekannt; der Parser ist deshalb tolerant.
 
 ## Quellen
 
 * SignalRGB-Plugin-API und offizielle LCD-Plugins: <https://gitlab.com/signalrgb/signal-plugins> (Branch `Development`,
-  `types/lcd.d.ts`, `types/device.d.ts`, `Plugins/Corsair/Corsair_ICUE_Link_LCD.js`, `Plugins/Lian Li/Lian_Li_Galahad_II_LCD.js`)
+  `types/lcd.d.ts`, `types/device.d.ts`, `Plugins/Corsair/Corsair_ICUE_Link_LCD.js`, `Plugins/Lian Li/Lian_Li_Galahad_II_LCD.js`;
+  Branch `beta`: `@SignalRGB/Serial/serial.d.ts`, `@SignalRGB/lcd/lcd.d.ts`, `Plugins/Turzx/Turzx_LCD_Controller.js`,
+  `Plugins/Hyte/CNVS.js`)
+* SignalRGB-Doku zum Serial-Modul: <https://docs.signalrgb.com/developer/plugins/advanced-communication/>
 * SignalRGB-Dokumentation und Changelogs: <https://docs.signalrgb.com/developer/plugins/>, <https://docs.signalrgb.com/changelogs/>
 * Beispiel für Benutzer-Faces: <https://github.com/thetunguskaevent/Guy_Pro_Signal_RGB_LCD_Faces>
 * Display-Protokoll: <https://github.com/senesees/Jungle-Leopard-Display-TZMRIT-PF360-LCD>, <https://github.com/yughias/JL-LCD-AIO>

@@ -94,3 +94,13 @@ test("device info: non-JSON replies and missing replies degrade to 'unknown' ins
 	assert.deepEqual(I.assessPanel(I.parseDeviceInfo("{\"model\":\"ABC-4inch\"}")), { status: "unknown", reason: "unknown-model" });
 	assert.deepEqual(I.assessPanel(null), { status: "unknown", reason: "no-reply" });
 });
+
+test("serial read results in any shape SignalRGB may return become plain bytes", () => {
+	assert.deepEqual(I.toBytes(undefined), []);
+	assert.deepEqual(I.toBytes(null), []);
+	assert.deepEqual(I.toBytes([0x55, 0xAA, 0x107]), [0x55, 0xAA, 0x07]);
+	assert.deepEqual(I.toBytes(new Uint8Array([1, 2, 3])), [1, 2, 3]);
+	assert.deepEqual(I.toBytes(new Uint8Array([4, 5]).buffer), [4, 5]);
+	assert.deepEqual(I.toBytes("Uª"), [0x55, 0xAA]);
+	assert.deepEqual(I.toBytes(42), []);
+});

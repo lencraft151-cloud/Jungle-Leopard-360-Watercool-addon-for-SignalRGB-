@@ -1,5 +1,6 @@
-# Removes the Jungle Leopard LCD Bridge: stops it, deletes the autostart entry and its folder.
-#   powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\JungleLeopardBridge\uninstall.ps1"
+# Removes the Jungle Leopard LCD Bridge of plugin 1.1.0: stops it, deletes the autostart entry and its folder.
+# Plugin 2.0.0 talks to the display through SignalRGB's own serial module and no longer needs the bridge.
+#   irm https://raw.githubusercontent.com/lencraft151-cloud/Jungle-Leopard-360-Watercool-addon-for-SignalRGB-/HEAD/bridge/uninstall.ps1 | iex
 
 $ErrorActionPreference = 'SilentlyContinue'
 
